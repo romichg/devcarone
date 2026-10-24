@@ -586,3 +586,8 @@ After building on your Docker host:
 
 TigerVNC flags and its explicit `-xstartup` option follow the
 [Debian Trixie manual](https://manpages.debian.org/trixie/tigervnc-standalone-server/tigervncserver.1.en.html).
+
+## License
+
+This project is licensed under the [MIT License](LICENSE). Third-party software
+and skills installed by the image retain their respective licenses.
