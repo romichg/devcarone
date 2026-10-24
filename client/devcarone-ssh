@@ -1,0 +1,64 @@
+#!/bin/sh
+# Reach devcarone VNC sessions from the SSH client.
+#
+#   devcarone-ssh DOCKER_HOST NAME [COMMAND...]
+#     Opens a shell (or runs COMMAND) in the session and forwards its VNC
+#     desktop to the local port the launcher recorded for it, while it runs.
+#   devcarone-ssh --proxy DOCKER_HOST NAME
+#     ProxyCommand for an optional "Host devcarone-*" entry (scp, rsync,
+#     editors); see README.
+#
+# NAME is the launcher's --name (work) or the container name (devcarone-work).
+# Each run makes two connections to DOCKER_HOST: one docker inspect for the
+# session's address, port, and user, then the forward to its sshd.
+set -eu
+usage() {
+    echo 'Usage: devcarone-ssh DOCKER_HOST NAME [COMMAND...]' >&2
+    echo '       devcarone-ssh --proxy DOCKER_HOST NAME' >&2
+    exit 2
+}
+proxy=no
+if [ "${1:-}" = --proxy ]; then
+    proxy=yes
+    shift
+fi
+[ $# -ge 2 ] || usage
+host=$1
+case $2 in
+    devcarone-*) name=$2 ;;
+    *) name=devcarone-$2 ;;
+esac
+shift 2
+[ $proxy = no ] || [ $# -eq 0 ] || usage
+# The name is passed to a remote shell; allow only launcher-style names.
+case $name in
+    devcarone-*[!A-Za-z0-9_-]*|devcarone-) echo "devcarone-ssh: invalid name: $name" >&2; exit 2 ;;
+esac
+
+# stdin may be the outer ssh's protocol stream (--proxy): -n keeps the lookup
+# from swallowing the client's greeting. ClearAllForwardings keeps forwards
+# configured for DOCKER_HOST's own entry from being requested again.
+info=$(ssh -n -o ClearAllForwardings=yes "$host" \
+    "docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}/{{index .Config.Labels \"devcarone.vnc-port\"}}/{{index .Config.Labels \"devcarone.user\"}}' $name")
+ip=${info%%/*}
+rest=${info#*/}
+port=${rest%%/*}
+user=${rest#*/}
+case $ip in
+    ''|*[!0-9a-f.:]*) echo "devcarone-ssh: $name on $host has no address" >&2; exit 1 ;;
+esac
+if [ $proxy = yes ]; then
+    exec ssh -W "$ip:22" "$host"  # -W implies ClearAllForwardings.
+fi
+case $port in
+    ''|*[!0-9]*) echo "devcarone-ssh: $name on $host is not a --vnc session (launched with this launcher version?)" >&2; exit 1 ;;
+esac
+case $user in
+    ''|-*|*[!A-Za-z0-9_.-]*) echo "devcarone-ssh: $name on $host has no valid devcarone.user label" >&2; exit 1 ;;
+esac
+
+echo "devcarone-ssh: VNC viewer: 127.0.0.1:$port, while this connection is open." >&2
+# A second connection to the same session cannot bind the port again; ssh
+# warns and continues, since the first connection already forwards it.
+exec ssh -o "ProxyCommand=ssh -W $ip:22 $host" -o HostKeyAlias=devcarone -l "$user" \
+    -L "$port:127.0.0.1:5999" "$name" "$@"

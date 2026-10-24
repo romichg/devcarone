@@ -1,0 +1,19 @@
+#!/bin/sh
+# VNC desktop session. Configuration is read from the image because the
+# launcher mounts the session's ~/.config over the image's home.
+DESKTOP=/opt/devcar/desktop
+unset SESSION_MANAGER DBUS_SESSION_BUS_ADDRESS
+if [ -f "$HOME/.Xresources" ]; then
+    xrdb -merge "$HOME/.Xresources"
+fi
+# Merged last so the VNC settings win over the host-oriented resources.
+xrdb -merge <<RESOURCES
+Xft.dpi: ${XFT_DPI:-168}
+Xft.antialias: true
+Xft.hinting: true
+Xft.rgba: rgb
+RESOURCES
+xsetroot -solid '#243447'
+tint2 -c "$DESKTOP/tint2/tint2rc" &
+devcar-terminal -geometry 135x29 &
+exec openbox --config-file "$DESKTOP/openbox/rc.xml"

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<openbox_menu xmlns="http://openbox.org/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://openbox.org/                 file:///usr/share/openbox/menu.xsd">
+	<menu id="root-menu" label="devcarone">
+		<item label="Terminal">
+			<action name="Execute">
+				<execute>devcar-terminal</execute>
+			</action>
+		</item>
+		<item label="VS Code">
+			<action name="Execute">
+				<execute>code --no-sandbox --force-device-scale-factor=1.65</execute>
+			</action>
+		</item>
+		<separator/>
+		<item label="Reconfigure Openbox">
+			<action name="Reconfigure"/>
+		</item>
+		<item label="Log out (ends the desktop)">
+			<action name="Exit"/>
+		</item>
+	</menu>
+</openbox_menu>

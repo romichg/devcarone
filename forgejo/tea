@@ -1,0 +1,9 @@
+#!/bin/sh
+# Use the login generated at startup from the mounted Forgejo token. It lives in
+# the container rather than the mounted ~/.config, so no session overlay keeps it.
+config_home=${TEA_CONFIG_HOME:-/run/devcar/tea}
+if [ -d "$config_home/tea" ]; then
+    XDG_CONFIG_HOME=$config_home
+    export XDG_CONFIG_HOME
+fi
+exec /opt/devcar/bin/tea "$@"

@@ -1,0 +1,9 @@
+#!/bin/sh
+# urxvt settings shared by X mode and the VNC desktop. rxvt's default Alt+arrow
+# starts with an extra Escape, which can be interpreted as Cancel by terminal
+# applications. Use xterm sequences.
+size=${URXVT_FONT_SIZE:-13}
+exec urxvt -fn "xft:DejaVu Sans Mono:size=$size" \
+    -fb "xft:DejaVu Sans Mono:size=$size:bold" \
+    -xrm 'URxvt.keysym.M-Up: \033[1;3A' \
+    -xrm 'URxvt.keysym.M-Down: \033[1;3B' "$@"

@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE=x
+SESSION=
+NAMED=0
+USAGE='Usage: devcarone [--vnc] [--name NAME]'
+while (( $# )); do
+    case $1 in
+        --vnc) MODE=vnc ;;
+        --name)
+            if (( $# < 2 )); then echo "$USAGE" >&2; exit 2; fi
+            SESSION=$2; NAMED=1; shift ;;
+        --name=*) SESSION=${1#--name=}; NAMED=1 ;;
+        --help|-h)
+            echo "$USAGE"
+            echo 'Default: host X terminal. --vnc: desktop over SSH.'
+            echo '--name NAME: container devcarone-NAME, also its SSH host name.'
+            echo 'The container runs in the background; docker stop NAME ends it.'
+            exit 0 ;;
+        *) echo "Unknown option: $1" >&2; echo "$USAGE" >&2; exit 2 ;;
+    esac
+    shift
+done
+# The name doubles as the container's host name and SSH client alias.
+if (( NAMED )) && [[ ! $SESSION =~ ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$ ]]; then
+    echo 'NAME must be 1-32 lowercase letters, digits, or inner hyphens.' >&2
+    exit 2
+fi
+
+# Site settings live in devcarone.env beside the launcher (or DEVCAR_ENV_FILE;
+# empty disables it): KEY=VALUE lines, read literally. The environment wins.
+SETTINGS=(MAINDIR DEVCAR_IMAGE NETWORK DNS VNC_GEOMETRY VNC_DEPTH VNC_DPI
+          VNC_FONT_SIZE XFT_DPI GDK_SCALE GDK_DPI_SCALE QT_SCALE_FACTOR DEVCAR_IP
+          DEVCAR_SKILLS SSH_HOST_KEY_DIR FORGEJO_URL FORGEJO_USER FORGEJO_TOKEN_FILE
+          GOGCLI_STATE_HOME GOG_HOME GOG_KEYRING_BACKEND GOG_ACCOUNT)
+ENV_FILE=${DEVCAR_ENV_FILE-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/devcarone.env}
+if [[ -n $ENV_FILE && ( -e $ENV_FILE || -n ${DEVCAR_ENV_FILE:-} ) ]]; then
+    line_number=0
+    while IFS= read -r line || [[ -n $line ]]; do
+        line_number=$((line_number + 1))
+        [[ ! $line =~ ^[[:space:]]*(#|$) ]] || continue
+        if [[ ! $line =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ||
+              " ${SETTINGS[*]} " != *" ${BASH_REMATCH[1]} "* ]]; then
+            echo "$ENV_FILE:$line_number: expected SETTING=value for a launcher setting." >&2
+            exit 1
+        fi
+        [[ -v ${BASH_REMATCH[1]} ]] || printf -v "${BASH_REMATCH[1]}" '%s' "${BASH_REMATCH[2]}"
+    done < "$ENV_FILE"
+fi
+
+: "${MAINDIR:=${XDG_DATA_HOME:-$HOME/.local/share}/devcarone}"
+: "${DEVCAR_IMAGE:=devcarone:v1}"
+: "${NETWORK:=}"
+: "${DNS:=}"
+: "${VNC_GEOMETRY:=1920x1080}"
+: "${VNC_DEPTH:=24}"
+: "${VNC_DPI:=168}"
+: "${VNC_FONT_SIZE:=8}"
+: "${XFT_DPI:=$VNC_DPI}"
+: "${GDK_SCALE:=1.8}"
+: "${GDK_DPI_SCALE:=0.5}"
+: "${QT_SCALE_FACTOR:=1.8}"
+: "${DEVCAR_IP:=}"
+: "${DEVCAR_SKILLS:=1}"
+: "${SSH_HOST_KEY_DIR:=$MAINDIR/ssh_host_keys}"
+: "${FORGEJO_URL:=}"
+: "${FORGEJO_USER:=}"
+: "${FORGEJO_TOKEN_FILE:=$MAINDIR/forgejo/token}"
+DEV_USER=$(id -un)
+: "${GOGCLI_STATE_HOME:=$MAINDIR/gogcli}"
+: "${GOG_HOME:=/home/$DEV_USER/.gogcli}"
+: "${GOG_KEYRING_BACKEND:=file}"
+: "${GOG_ACCOUNT:=}"
+: "${GOG_KEYRING_PASSWORD:=}"
+LOCAL_UID=$(id -u)
+RENDER_GID=$(stat -c %g /dev/dri/renderD128)
+WORKDIR=$PWD
+CONFDIR=$MAINDIR/master_config
+
+# These characters have special meanings in Docker/overlay mount paths.
+if [[ $MAINDIR != /* || $MAINDIR == *[,:\\]* ]]; then
+    echo 'MAINDIR must be absolute and contain no comma, colon, or backslash.' >&2
+    exit 1
+fi
+for path in config pki vscode codex claude; do
+    if [[ ! -d $CONFDIR/$path ]]; then
+        echo "Missing configuration directory: $CONFDIR/$path" >&2
+        exit 1
+    fi
+done
+if [[ -n $DEVCAR_IP && -z $NETWORK ]]; then
+    echo 'DEVCAR_IP requires NETWORK, a user-defined Docker network with a subnet.' >&2
+    exit 1
+fi
+if [[ -n $SESSION ]] && docker container inspect "devcarone-$SESSION" >/dev/null 2>&1; then
+    echo "Container devcarone-$SESSION already exists; stop it or choose another --name." >&2
+    exit 1
+fi
+if [[ $DEVCAR_SKILLS != [01] ]]; then
+    echo 'DEVCAR_SKILLS must be 0 or 1.' >&2
+    exit 1
+fi
+if [[ ! -f $CONFDIR/Xresources ]]; then
+    echo "Missing configuration file: $CONFDIR/Xresources" >&2
+    exit 1
+fi
+if [[ $MODE == vnc ]]; then
+    if [[ ! -s $MAINDIR/authorized_keys || ! -r $MAINDIR/authorized_keys ]]; then
+        echo "VNC requires a readable, nonempty $MAINDIR/authorized_keys file." >&2
+        exit 1
+    fi
+    if [[ $SSH_HOST_KEY_DIR != /* || $SSH_HOST_KEY_DIR == *[,:\\]* ]]; then
+        echo 'SSH_HOST_KEY_DIR must be absolute and contain no comma, colon, or backslash.' >&2
+        exit 1
+    fi
+    # One persistent host key keeps SSH client entries valid across launches.
+    HOST_KEY=$SSH_HOST_KEY_DIR/ssh_host_ed25519_key
+    if [[ ! -e $HOST_KEY ]]; then
+        (umask 077; mkdir -p -- "$SSH_HOST_KEY_DIR" &&
+            ssh-keygen -q -t ed25519 -N '' -C devcarone -f "$HOST_KEY")
+        echo "Created SSH host key $HOST_KEY" >&2
+    fi
+    if [[ ! -s $HOST_KEY || ! -r $HOST_KEY ]]; then
+        echo "SSH host key must be a readable, nonempty file: $HOST_KEY" >&2
+        exit 1
+    fi
+else
+    : "${DISPLAY:?Set DISPLAY to your host X display.}"
+fi
+
+for path in "$GOGCLI_STATE_HOME" "$GOG_HOME"; do
+    if [[ $path != /* || $path == *[,:\\]* ]]; then
+        echo 'Gog paths must be absolute and contain no comma, colon, or backslash.' >&2
+        exit 1
+    fi
+done
+if [[ -n $GOG_ACCOUNT && -z $GOG_KEYRING_PASSWORD && $GOG_KEYRING_BACKEND == file ]]; then
+    if [[ ! -t 0 ]]; then
+        echo 'GOG_KEYRING_PASSWORD is required when GOG_ACCOUNT is set during noninteractive startup.' >&2
+        exit 1
+    fi
+    read -rsp 'gog keyring password: ' GOG_KEYRING_PASSWORD
+    printf '\n' >&2
+    if [[ -z $GOG_KEYRING_PASSWORD ]]; then
+        echo 'gog keyring password cannot be empty.' >&2
+        exit 1
+    fi
+fi
+export GOG_HOME GOG_KEYRING_BACKEND GOG_ACCOUNT GOG_KEYRING_PASSWORD
+# Forgejo access is optional: without a token file, the container has none.
+FORGEJO_TOKEN=
+if [[ -e $FORGEJO_TOKEN_FILE ]]; then
+    if [[ $FORGEJO_TOKEN_FILE != /* || $FORGEJO_TOKEN_FILE == *[,:\\]* ]]; then
+        echo 'FORGEJO_TOKEN_FILE must be absolute and contain no comma, colon, or backslash.' >&2
+        exit 1
+    fi
+    if [[ ! -s $FORGEJO_TOKEN_FILE || ! -r $FORGEJO_TOKEN_FILE ]]; then
+        echo "Forgejo token must be a readable, nonempty file: $FORGEJO_TOKEN_FILE" >&2
+        exit 1
+    fi
+    if [[ ! $FORGEJO_URL =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ||
+          ! $FORGEJO_USER =~ ^[A-Za-z0-9._-]+$ ]]; then
+        echo 'A Forgejo token needs FORGEJO_URL=https://HOST[:PORT] and a plain FORGEJO_USER name.' >&2
+        exit 1
+    fi
+    FORGEJO_TOKEN=$FORGEJO_TOKEN_FILE
+fi
+# Share auth across sessions; preserve permissions on an existing directory.
+if [[ ! -e $GOGCLI_STATE_HOME ]]; then
+    (umask 077; mkdir -p -- "$GOGCLI_STATE_HOME")
+fi
+if [[ ! -d $GOGCLI_STATE_HOME || ! -w $GOGCLI_STATE_HOME ]]; then
+    echo "Gog state directory must be writable: $GOGCLI_STATE_HOME" >&2
+    exit 1
+fi
+
+OVERLAY=$(mktemp -d "$MAINDIR/$(date +%Y-%m-%d_%H-%M-%S)_${SESSION:+${SESSION}_}XXXXXX")
+RUNDIR=$OVERLAY/merged
+NAME=devcarone-${SESSION:-${OVERLAY##*/}}
+XAUTH=
+MOUNTED=0
+DETACHED=0
+
+# Runs as root, detached from the terminal, once the container has started: it
+# keeps the container's output, removes the container, and only then releases
+# the overlay. A container removed by hand (docker rm -f) is handled too.
+WATCHER='status=$(docker wait "$1" 2>/dev/null)
+docker logs "$1" 2>&1
+echo "devcarone: container $1 exited with status ${status:-unknown}."
+docker rm -f "$1" >/dev/null 2>&1
+if docker container inspect "$1" >/dev/null 2>&1; then
+    echo "devcarone: could not remove $1; overlay retained at $2." >&2
+    exit 1
+fi
+umount "$2" && echo "devcarone: unmounted $2."
+[ -z "$3" ] || rm -f -- "$3"'
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM HUP
+    set +e
+    # After a successful launch the watcher owns the container and overlay.
+    if (( DETACHED )); then
+        exit "$status"
+    fi
+    # Stop the container before releasing its bind-mounted overlay.
+    if [[ -s $OVERLAY/container.cid ]]; then
+        if ! docker rm -f "$(cat "$OVERLAY/container.cid")" >/dev/null; then
+            echo "Could not remove container; overlay retained at $RUNDIR" >&2
+            status=1
+            MOUNTED=0
+        fi
+    fi
+    if (( MOUNTED )); then
+        sudo umount "$RUNDIR" || status=1
+    fi
+    [[ -z $XAUTH ]] || rm -f -- "$XAUTH"
+    # Keep upper/work and session metadata.
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+mkdir -p "$OVERLAY"/{upper,work,merged}
+sudo mount -t overlay overlay \
+    -o "lowerdir=$CONFDIR,upperdir=$OVERLAY/upper,workdir=$OVERLAY/work" \
+    "$RUNDIR"
+MOUNTED=1
+
+ARGS=(--cidfile "$OVERLAY/container.cid" --name "$NAME" --hostname "$NAME"
+      --init --shm-size=512m
+      --env "DEVCAR_USER=$DEV_USER" --env "LOCAL_UID=$LOCAL_UID"
+      --env "RENDER_GID=$RENDER_GID" --env "DEVCAR_SKILLS=$DEVCAR_SKILLS"
+      --env GOG_HOME --env GOG_KEYRING_BACKEND --env GOG_ACCOUNT
+      --env GOG_KEYRING_PASSWORD
+      --volume "$GOGCLI_STATE_HOME:$GOG_HOME"
+      --workdir "/home/$DEV_USER"
+      --device /dev/dri/renderD128 --volume /dev/dri:/dev/dri:rw)
+for path in config pki vscode codex claude; do
+    ARGS+=(--volume "$RUNDIR/$path:/home/$DEV_USER/.$path")
+done
+ARGS+=(--volume "$RUNDIR/Xresources:/home/$DEV_USER/.Xresources"
+       --volume "$WORKDIR:/home/$DEV_USER/src")
+if [[ -n $NETWORK ]]; then
+    ARGS+=(--network "$NETWORK")
+fi
+if [[ -n $DNS ]]; then
+    ARGS+=(--dns "$DNS")
+fi
+if [[ -n $DEVCAR_IP ]]; then
+    ARGS+=(--ip "$DEVCAR_IP")
+fi
+if [[ -n $FORGEJO_TOKEN ]]; then
+    ARGS+=(--volume "$FORGEJO_TOKEN:/run/devcar/forgejo-token:ro"
+           --env "FORGEJO_URL=$FORGEJO_URL" --env "FORGEJO_USER=$FORGEJO_USER")
+fi
+if [[ -d /run/user/$LOCAL_UID/pulse ]]; then
+    ARGS+=(--volume "/run/user/$LOCAL_UID/pulse:/tmp/pulse:rw"
+           --env PULSE_SERVER=/tmp/pulse/native)
+fi
+
+if [[ $MODE == x ]]; then
+    XAUTH=$(mktemp "${TMPDIR:-/tmp}/.docker.xauth.XXXXXX")
+    xauth nlist "$DISPLAY" | sed 's/^..../ffff/' | xauth -f "$XAUTH" nmerge -
+    if [[ ! -s $XAUTH ]]; then
+        echo "No Xauthority cookie found for DISPLAY=$DISPLAY" >&2
+        exit 1
+    fi
+    ARGS+=(--volume /tmp/.X11-unix:/tmp/.X11-unix:ro
+           --volume "$XAUTH:$XAUTH:ro"
+           --env "DISPLAY=$DISPLAY" --env "XAUTHORITY=$XAUTH")
+else
+    ARGS+=(--volume "$MAINDIR/authorized_keys:/run/devcar/authorized_keys:ro"
+           --volume "$HOST_KEY:/run/devcar/ssh_host_ed25519_key:ro"
+           --env "VNC_GEOMETRY=$VNC_GEOMETRY"
+           --env "VNC_DEPTH=$VNC_DEPTH" --env "VNC_DPI=$VNC_DPI"
+           --env "VNC_FONT_SIZE=$VNC_FONT_SIZE" --env "XFT_DPI=$XFT_DPI"
+           --env "GDK_SCALE=$GDK_SCALE" --env "GDK_DPI_SCALE=$GDK_DPI_SCALE"
+           --env "QT_SCALE_FACTOR=$QT_SCALE_FACTOR")
+    # Pick a client-side tunnel port no other running session uses, and record
+    # it with the login user for client/devcarone-ssh; the next launch skips
+    # recorded ports.
+    used=" $(docker ps --filter label=devcarone.vnc-port \
+        --format '{{.Label "devcarone.vnc-port"}}' | tr '\n' ' ') "
+    VNC_PORT=15999
+    while [[ $used == *" $VNC_PORT "* ]]; do
+        VNC_PORT=$((VNC_PORT + 1))
+    done
+    ARGS+=(--label "devcarone.vnc-port=$VNC_PORT" --label "devcarone.user=$DEV_USER")
+fi
+
+docker create "${ARGS[@]}" "$DEVCAR_IMAGE" "$MODE" >/dev/null
+CONTAINER=$(cat "$OVERLAY/container.cid")
+docker start "$CONTAINER" >/dev/null
+# The watcher outlives this launcher, so closing the terminal or pressing
+# Ctrl-C here does not stop the container.
+sudo setsid -f sh -c "$WATCHER" devcarone-cleanup "$CONTAINER" "$RUNDIR" "$XAUTH" \
+    </dev/null >>"$OVERLAY/session.log" 2>&1
+DETACHED=1
+printf 'Container: %s (running in the background)\nSession files: %s\n' "$NAME" "$OVERLAY"
+if [[ $MODE == vnc ]]; then
+    IP=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CONTAINER")
+    JUMP=$(hostname)
+    printf 'SSH: %s@%s port 22; VNC is 127.0.0.1:5999 inside the container.\n' "$DEV_USER" "$IP"
+    FORWARD="-L $VNC_PORT:127.0.0.1:5999"
+    printf 'From this host:       ssh -N %s %s@%s\n' "$FORWARD" "$DEV_USER" "$IP"
+    printf 'From another machine: ssh -N -J %s %s %s@%s\n' "$JUMP" "$FORWARD" "$DEV_USER" "$IP"
+    printf 'With client/devcarone-ssh (shell + VNC tunnel): devcarone-ssh %s %s\n' \
+        "$JUMP" "${SESSION:-$NAME}"
+    if [[ -z $SESSION ]]; then
+        printf 'Use --name NAME for a short, stable SSH host name.\n'
+    fi
+    printf 'Connect your VNC viewer to 127.0.0.1:%s.\n' "$VNC_PORT"
+fi
+printf 'Stop it with: docker stop %s\n' "$NAME"
+printf 'Output and cleanup are logged to %s/session.log\n' "$OVERLAY"
