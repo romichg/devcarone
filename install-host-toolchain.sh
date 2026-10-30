@@ -2,13 +2,31 @@
 # Install the Dockerfile's toolchain on Debian Trixie, without its container runtime.
 set -euo pipefail
 umask 022
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin
 export DEBIAN_FRONTEND=noninteractive
 
+# Tests run the installer against a marked temporary root that they own, with
+# substitute commands in its test-bin. Production always uses / and uid 0.
+if [[ -n ${DEVCAR_HOST_TOOLCHAIN_TEST_ROOT:-} ]]; then
+    ROOT=$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT
+    [[ $ROOT == /* && -f $ROOT/.devcarone-host-toolchain-test-root ]] || {
+        echo 'The installer test root must be absolute and marked.' >&2; exit 2; }
+    OWNER_UID=$(stat -c %u -- "$ROOT")
+    SYSTEM_PATH=$ROOT/test-bin:$ROOT/usr/bin
+else
+    ROOT= OWNER_UID=0 SYSTEM_PATH=/usr/sbin:/usr/bin:/sbin:/bin
+fi
+readonly ROOT OWNER_UID SYSTEM_PATH
+export PATH=$SYSTEM_PATH:$ROOT/usr/local/bin
+
 readonly SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-readonly STATE_DIR=/var/lib/devcarone-host-toolchain
-readonly TOOL_DIR=/usr/local/lib/devcarone-toolchain
-readonly TOOLING_DIR=/opt/devcar/tooling
+readonly STATE_DIR=$ROOT/var/lib/devcarone-host-toolchain
+readonly TOOL_DIR=$ROOT/usr/local/lib/devcarone-toolchain
+readonly TOOLING_DIR=$ROOT/opt/devcar/tooling
+readonly BIN_DIR=$ROOT/usr/local/bin
+readonly APT_DIR=$ROOT/etc/apt
+readonly MICROSOFT_KEYRING=$ROOT/usr/share/keyrings/microsoft.asc.gpg
+readonly PROFILE_FILE=$ROOT/etc/profile.d/devcarone-host-toolchain.sh
+readonly TOOLING_GENERATIONS=$ROOT/opt/devcar/host-toolchain/tooling
 readonly NPM_REGISTRY=https://registry.npmjs.org/
 readonly TEA_KNOWN=v0.16.0 PLANNOTATOR_KNOWN=v0.27.21 GOG_KNOWN=v0.43.0
 
@@ -41,25 +59,25 @@ require_file "$SCRIPT_DIR/link-skills.sh"
 require_file "$SCRIPT_DIR/configure-codex.py"
 require_file "$SCRIPT_DIR/configure-claude.py"
 require_file "$SCRIPT_DIR/go-ipv4-proxy.py"
-[[ $(id -u) == 0 ]] || die 'Run as root (usually with sudo).'
+[[ $(id -u) == "$OWNER_UID" ]] || die 'Run as root (usually with sudo).'
 # Do not try to adapt this image's x64 packages to another platform.
 [[ $(dpkg --print-architecture) == amd64 ]] || die 'Debian amd64 is required.'
 # shellcheck source=/dev/null
-. /etc/os-release
+. "$ROOT/etc/os-release"
 [[ ${ID:-} == debian && ${VERSION_CODENAME:-} == trixie ]] || die 'Debian Trixie is required.'
 for command_name in node npm codex copilot opencode pi claude firebase playwright tea gog plannotator; do
     command_path=$(command -v "$command_name" || true)
-    if [[ -n $command_path && $command_path != /usr/local/bin/$command_name ]]; then
+    if [[ -n $command_path && $command_path != $BIN_DIR/$command_name ]]; then
         die "Unmanaged $command_name command is already on PATH at $command_path"
     fi
-    if [[ $command_path == /usr/local/bin/$command_name && ! -d $STATE_DIR ]]; then
+    if [[ $command_path == $BIN_DIR/$command_name && ! -d $STATE_DIR ]]; then
         die "Unmanaged $command_name command is already installed at $command_path"
     fi
 done
 for command_name in code chromium; do
     command_path=$(command -v "$command_name" || true)
-    if [[ -n $command_path && $command_path != /usr/bin/$command_name && \
-          $command_path != /bin/$command_name ]]; then
+    if [[ -n $command_path && $command_path != $ROOT/usr/bin/$command_name && \
+          $command_path != $ROOT/bin/$command_name ]]; then
         die "Unmanaged $command_name command is already on PATH at $command_path"
     fi
 done
@@ -110,54 +128,54 @@ readonly TEA_KEY=7C9E68152594688862D62AF62D9AE806EC1592E2
 # Apt authenticates the bootstrap packages before gpg/jq are available. On a
 # standard Trixie machine, debian.sources scopes apt to the Debian archive key.
 debian_signed_by=$(awk -F': ' '$1 == "Signed-By" { print $2 }' \
-    /etc/apt/sources.list.d/debian.sources | sort -u)
+    $APT_DIR/sources.list.d/debian.sources | sort -u)
 case $debian_signed_by in
     /usr/share/keyrings/debian-archive-keyring.pgp|/usr/share/keyrings/debian-archive-keyring.gpg) ;;
     *) die 'Expected Debian Signed-By archive keyring is missing.' ;;
 esac
-[[ -f $debian_signed_by ]] || die "Missing Debian archive keyring $debian_signed_by"
-if [[ -s /etc/apt/sources.list ]]; then
-    die 'Additional apt sources in /etc/apt/sources.list need review before installation.'
+[[ -f $ROOT$debian_signed_by ]] || die "Missing Debian archive keyring $debian_signed_by"
+if [[ -s $APT_DIR/sources.list ]]; then
+    die 'Additional apt sources in $APT_DIR/sources.list need review before installation.'
 fi
-for source_file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+for source_file in $APT_DIR/sources.list.d/*.list $APT_DIR/sources.list.d/*.sources; do
     [[ -e $source_file ]] || continue
     case $source_file in
-        /etc/apt/sources.list.d/debian.sources|/etc/apt/sources.list.d/vscode.list) ;;
+        $APT_DIR/sources.list.d/debian.sources|$APT_DIR/sources.list.d/vscode.list) ;;
         *) die "Additional apt source needs review: $source_file" ;;
     esac
 done
 vscode_source='deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.asc.gpg] https://packages.microsoft.com/repos/code stable main'
-if [[ -e /etc/apt/sources.list.d/vscode.list ]]; then
-    [[ $(cat /etc/apt/sources.list.d/vscode.list) == "$vscode_source" ]] || \
+if [[ -e $APT_DIR/sources.list.d/vscode.list ]]; then
+    [[ $(cat $APT_DIR/sources.list.d/vscode.list) == "$vscode_source" ]] || \
         die 'Existing VS Code apt source differs from the expected signed repository.'
-    [[ -f /usr/share/keyrings/microsoft.asc.gpg ]] && \
-        cmp -s "$SCRIPT_DIR/microsoft.asc.gpg" /usr/share/keyrings/microsoft.asc.gpg || \
+    [[ -f $MICROSOFT_KEYRING ]] && \
+        cmp -s "$SCRIPT_DIR/microsoft.asc.gpg" "$MICROSOFT_KEYRING" || \
         die 'Existing Microsoft apt key differs from the trusted bundle.'
 fi
 vscode_pins=$'Package: code\nPin: origin packages.microsoft.com\nPin-Priority: 600\n\nPackage: *\nPin: origin packages.microsoft.com\nPin-Priority: -1'
-if [[ -e /etc/apt/preferences.d/devcarone-host-toolchain ]] && \
-    [[ $(cat /etc/apt/preferences.d/devcarone-host-toolchain) != "$vscode_pins" ]]; then
+if [[ -e $APT_DIR/preferences.d/devcarone-host-toolchain ]] && \
+    [[ $(cat $APT_DIR/preferences.d/devcarone-host-toolchain) != "$vscode_pins" ]]; then
     die 'Existing VS Code apt preferences differ from the installer policy.'
 fi
-printf '%s\n' "$vscode_pins" > /etc/apt/preferences.d/devcarone-host-toolchain
-if grep -E '^URIs: ' /etc/apt/sources.list.d/debian.sources | \
+printf '%s\n' "$vscode_pins" > $APT_DIR/preferences.d/devcarone-host-toolchain
+if grep -E '^URIs: ' $APT_DIR/sources.list.d/debian.sources | \
     grep -Ev '^URIs: https?://(deb|security)\.debian\.org/(debian|debian-security)( |$)' >/dev/null; then
     die 'Debian source contains an unexpected repository URI.'
 fi
-if ! grep -Eq '^Components: (.* )?non-free( |$)' /etc/apt/sources.list.d/debian.sources; then
+if ! grep -Eq '^Components: (.* )?non-free( |$)' $APT_DIR/sources.list.d/debian.sources; then
     sed -i 's/^Components: main$/Components: main contrib non-free non-free-firmware/' \
-        /etc/apt/sources.list.d/debian.sources
+        $APT_DIR/sources.list.d/debian.sources
 fi
 apt-get update
 apt-get -y --no-install-recommends install ca-certificates curl gnupg jq xz-utils
-verify_key_file "$debian_signed_by" "$DEBIAN_KEYS"
+verify_key_file "$ROOT$debian_signed_by" "$DEBIAN_KEYS"
 verify_key_file "$SCRIPT_DIR/microsoft.asc.gpg" "$MICROSOFT_KEY"
 verify_key_file "$SCRIPT_DIR/keys/nodejs-release.asc" "$NODE_KEYS"
 verify_key_file "$SCRIPT_DIR/keys/teabot.asc" "$TEA_KEY"
 
-install -m 644 "$SCRIPT_DIR/microsoft.asc.gpg" /usr/share/keyrings/microsoft.asc.gpg
+install -m 644 "$SCRIPT_DIR/microsoft.asc.gpg" "$MICROSOFT_KEYRING"
 printf '%s\n' "$vscode_source" \
-    > /etc/apt/sources.list.d/vscode.list
+    > $APT_DIR/sources.list.d/vscode.list
 apt-get update
 
 APT_PACKAGES=(
@@ -220,23 +238,23 @@ if ((${#APT_INSTALL[@]})); then
     apt-get -y --no-install-recommends install "${APT_INSTALL[@]}"
 fi
 plannotator_profile=$'export PLANNOTATOR_BROWSER=/usr/bin/chromium\nexport PLANNOTATOR_REMOTE=0'
-if [[ -e /etc/profile.d/devcarone-host-toolchain.sh ]] && \
-    [[ $(cat /etc/profile.d/devcarone-host-toolchain.sh) != "$plannotator_profile" ]]; then
+if [[ -e "$PROFILE_FILE" ]] && \
+    [[ $(cat "$PROFILE_FILE") != "$plannotator_profile" ]]; then
     die 'Existing Plannotator environment profile differs from the installer policy.'
 fi
-printf '%s\n' "$plannotator_profile" > /etc/profile.d/devcarone-host-toolchain.sh
+printf '%s\n' "$plannotator_profile" > "$PROFILE_FILE"
 
-mkdir -p "$STATE_DIR" "$TOOL_DIR/node" "$TOOL_DIR/npm" /opt/devcar/host-toolchain/tooling
-for secure_dir in /usr/local/bin /usr/local/lib "$STATE_DIR" "$TOOL_DIR" \
-    "$TOOL_DIR/node" "$TOOL_DIR/npm" /opt/devcar /opt/devcar/host-toolchain \
-    /opt/devcar/host-toolchain/tooling; do
-    [[ $(stat -c %u "$secure_dir") == 0 ]] || die "Install directory is not root-owned: $secure_dir"
+mkdir -p "$BIN_DIR" "$STATE_DIR" "$TOOL_DIR/node" "$TOOL_DIR/npm" "$TOOLING_GENERATIONS"
+for secure_dir in "$BIN_DIR" "$ROOT/usr/local/lib" "$STATE_DIR" "$TOOL_DIR" \
+    "$TOOL_DIR/node" "$TOOL_DIR/npm" "$ROOT/opt/devcar" "$ROOT/opt/devcar/host-toolchain" \
+    "$TOOLING_GENERATIONS"; do
+    [[ $(stat -c %u "$secure_dir") == "$OWNER_UID" ]] || die "Install directory is not root-owned: $secure_dir"
     permissions=$(stat -c %a "$secure_dir")
     (( (8#$permissions & 0022) == 0 )) || die "Install directory is writable by non-root users: $secure_dir"
 done
 for state_file in "$STATE_DIR"/*; do
     [[ -e $state_file ]] || continue
-    [[ -f $state_file && ! -L $state_file && $(stat -c %u "$state_file") == 0 ]] || \
+    [[ -f $state_file && ! -L $state_file && $(stat -c %u "$state_file") == "$OWNER_UID" ]] || \
         die "Untrusted state file: $state_file"
     permissions=$(stat -c %a "$state_file")
     (( (8#$permissions & 0022) == 0 )) || die "Writable state file: $state_file"
@@ -263,7 +281,7 @@ managed_binary() {
 }
 
 for name in node npm npx corepack; do
-    managed_link "/usr/local/bin/$name" "$TOOL_DIR/current-node/bin/$name"
+    managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-node/bin/$name"
 done
 managed_link "$TOOL_DIR/current-node" "${TOOL_DIR}/node/$(cat "$STATE_DIR/node-version" 2>/dev/null || true)"
 managed_link "$TOOL_DIR/current-npm" "${TOOL_DIR}/npm/$(cat "$STATE_DIR/npm-generation" 2>/dev/null || true)"
@@ -273,16 +291,16 @@ for kind in node npm; do
         while IFS= read -r name; do
             [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid recorded $kind command name."
             if [[ $kind == node ]]; then
-                managed_link "/usr/local/bin/$name" "$TOOL_DIR/current-node/bin/$name"
+                managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-node/bin/$name"
             else
-                managed_link "/usr/local/bin/$name" "$TOOL_DIR/current-npm/node_modules/.bin/$name"
+                managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-npm/node_modules/.bin/$name"
             fi
         done < "$STATE_DIR/$kind-bins"
     fi
 done
-managed_binary /usr/local/bin/tea "$STATE_DIR/tea.sha256"
-managed_binary /usr/local/bin/gog "$STATE_DIR/gog.sha256"
-managed_binary /usr/local/bin/plannotator "$STATE_DIR/plannotator.sha256"
+managed_binary "$BIN_DIR/tea" "$STATE_DIR/tea.sha256"
+managed_binary "$BIN_DIR/gog" "$STATE_DIR/gog.sha256"
+managed_binary "$BIN_DIR/plannotator" "$STATE_DIR/plannotator.sha256"
 
 INSTALL_MANAGED=1
 if [[ -e $STATE_DIR/node-version || -e $STATE_DIR/npm-generation || \
@@ -336,27 +354,27 @@ npm_stage=$WORK/npm-stage
 mkdir "$npm_stage"
 export NPM_CONFIG_USERCONFIG=/dev/null NPM_CONFIG_GLOBALCONFIG=/dev/null
 export NPM_CONFIG_CACHE=$WORK/npm-cache
-PATH=$node_stage/bin:/usr/bin:/bin "$node_stage/bin/npm" install --prefix "$npm_stage" \
+PATH=$node_stage/bin:$SYSTEM_PATH "$node_stage/bin/npm" install --prefix "$npm_stage" \
     --registry="$NPM_REGISTRY" --ignore-scripts "${NPM_PACKAGES[@]}"
-PATH=$node_stage/bin:/usr/bin:/bin "$node_stage/bin/npm" audit signatures --prefix "$npm_stage" \
+PATH=$node_stage/bin:$SYSTEM_PATH "$node_stage/bin/npm" audit signatures --prefix "$npm_stage" \
     --registry="$NPM_REGISTRY" || die 'npm registry signature or provenance audit failed.'
 for binary in "$npm_stage"/node_modules/.bin/*; do
     [[ -e $binary || -L $binary ]] || continue
     name=${binary##*/}
-    managed_link "/usr/local/bin/$name" "$TOOL_DIR/current-npm/node_modules/.bin/$name"
+    managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-npm/node_modules/.bin/$name"
 done
-PATH=$node_stage/bin:/usr/bin:/bin "$node_stage/bin/npm" rebuild --prefix "$npm_stage" \
+PATH=$node_stage/bin:$SYSTEM_PATH "$node_stage/bin/npm" rebuild --prefix "$npm_stage" \
     --registry="$NPM_REGISTRY" @openai/codex @github/copilot opencode-ai \
     @anthropic-ai/claude-code firebase-tools @playwright/test
 
 for binary in "$npm_stage"/node_modules/.bin/*; do
     [[ -e $binary || -L $binary ]] || continue
     name=${binary##*/}
-    managed_link "/usr/local/bin/$name" "$TOOL_DIR/current-npm/node_modules/.bin/$name"
+    managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-npm/node_modules/.bin/$name"
 done
 for binary in "$node_stage"/bin/*; do
     name=${binary##*/}
-    managed_link "/usr/local/bin/$name" "$TOOL_DIR/current-node/bin/$name"
+    managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-node/bin/$name"
 done
 
 if [[ -e $TOOL_DIR/node/$node_version ]]; then
@@ -369,10 +387,10 @@ mv -- "$npm_stage" "$TOOL_DIR/npm/$npm_generation"
 set_link "$TOOL_DIR/current-node" "$TOOL_DIR/node/$node_version"
 set_link "$TOOL_DIR/current-npm" "$TOOL_DIR/npm/$npm_generation"
 for binary in "$TOOL_DIR/node/$node_version"/bin/*; do
-    set_link "/usr/local/bin/${binary##*/}" "$TOOL_DIR/current-node/bin/${binary##*/}"
+    set_link "$BIN_DIR/${binary##*/}" "$TOOL_DIR/current-node/bin/${binary##*/}"
 done
 for binary in "$TOOL_DIR/npm/$npm_generation"/node_modules/.bin/*; do
-    set_link "/usr/local/bin/${binary##*/}" "$TOOL_DIR/current-npm/node_modules/.bin/${binary##*/}"
+    set_link "$BIN_DIR/${binary##*/}" "$TOOL_DIR/current-npm/node_modules/.bin/${binary##*/}"
 done
 for kind in node npm; do
     if [[ $kind == node ]]; then search_dir=$TOOL_DIR/node/$node_version/bin
@@ -386,7 +404,7 @@ for kind in node npm; do
     if [[ -f $STATE_DIR/$kind-bins ]]; then
         while IFS= read -r old_name; do
             if ! grep -Fxq -- "$old_name" "$new_names"; then
-                rm -- "/usr/local/bin/$old_name"
+                rm -- "$BIN_DIR/$old_name"
             fi
         done < "$STATE_DIR/$kind-bins"
     fi
@@ -394,7 +412,7 @@ for kind in node npm; do
 done
 printf '%s\n' "$node_version" > "$STATE_DIR/node-version"
 printf '%s\n' "$npm_generation" > "$STATE_DIR/npm-generation"
-PATH=/usr/local/bin:/usr/bin:/bin npm cache clean --force
+PATH=$BIN_DIR:$SYSTEM_PATH npm cache clean --force
 
 # Metadata selects a release; cryptographic verification below decides whether
 # its bytes may be installed. Malformed or unavailable metadata uses the known
@@ -448,8 +466,8 @@ grep -q "^\[GNUPG:\] VALIDSIG .* ${TEA_KEY}\$" "$WORK/tea-gpg-status" || die 'Un
 tea_hash=$(awk -v file="$tea_asset" '$2 == file { print $1 }' "$WORK/checksums.txt")
 [[ $tea_hash =~ ^[a-fA-F0-9]{64}$ ]] || die 'tea asset is absent from its signed checksum list.'
 printf '%s  %s\n' "$tea_hash" "$WORK/$tea_asset" | sha256sum -c - >/dev/null || die 'tea checksum failed.'
-install -m 755 "$WORK/$tea_asset" /usr/local/bin/tea
-sha256sum /usr/local/bin/tea | awk '{print $1}' > "$STATE_DIR/tea.sha256"
+install -m 755 "$WORK/$tea_asset" "$BIN_DIR/tea"
+sha256sum "$BIN_DIR/tea" | awk '{print $1}' > "$STATE_DIR/tea.sha256"
 printf '%s\n' "$tea_tag" > "$STATE_DIR/tea.version"
 fi
 
@@ -492,10 +510,10 @@ matt_commit=$(jq -er .sha "$matt_commit_json")
 [[ $matt_commit =~ ^[a-fA-F0-9]{40}$ ]] || die 'Invalid Matt Pocock commit ID.'
 bash "$SCRIPT_DIR/install-tooling.sh" "$matt_commit" "$plannotator_tag" "$tooling_stage"
 tooling_generation=$(date -u +%Y%m%dT%H%M%SZ)-$$
-tooling_target=/opt/devcar/host-toolchain/tooling/$tooling_generation
+tooling_target=$TOOLING_GENERATIONS/$tooling_generation
 mv -- "$tooling_stage/opt/devcar/tooling" "$tooling_target"
-install -m 755 "$tooling_stage/usr/local/bin/plannotator" /usr/local/bin/plannotator
-sha256sum /usr/local/bin/plannotator | awk '{print $1}' > "$STATE_DIR/plannotator.sha256"
+install -m 755 "$tooling_stage/usr/local/bin/plannotator" "$BIN_DIR/plannotator"
+sha256sum "$BIN_DIR/plannotator" | awk '{print $1}' > "$STATE_DIR/plannotator.sha256"
 set_link "$TOOLING_DIR" "$tooling_target"
 printf '%s\n' "$tooling_target" > "$STATE_DIR/tooling-target"
 printf '%s\n' "$plannotator_tag" > "$STATE_DIR/plannotator.version"
@@ -551,8 +569,8 @@ run_go_install "$gog_tag" 2> "$WORK/gog-error" || {
         fi
     }
 if ((!gog_skip)); then
-install -m 755 "$WORK/go-bin/gog" /usr/local/bin/gog
-sha256sum /usr/local/bin/gog | awk '{print $1}' > "$STATE_DIR/gog.sha256"
+install -m 755 "$WORK/go-bin/gog" "$BIN_DIR/gog"
+sha256sum "$BIN_DIR/gog" | awk '{print $1}' > "$STATE_DIR/gog.sha256"
 printf '%s\n' "$gog_tag" > "$STATE_DIR/gog.version"
 fi
 kill "$GO_PROXY_PID" 2>/dev/null || true
@@ -571,7 +589,7 @@ if [[ -n $TARGET_USER ]]; then
     gosu "$TARGET_USER" env HOME="$user_home" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
         SHELL="$user_shell" CLAUDE_CONFIG_DIR="$user_home/.claude" \
         python3 "$SCRIPT_DIR/configure-claude.py"
-    DEVCAR_TOOLING=$TOOLING_DIR bash "$SCRIPT_DIR/link-skills.sh" /etc/codex/skills on
+    DEVCAR_TOOLING=$TOOLING_DIR bash "$SCRIPT_DIR/link-skills.sh" "$ROOT/etc/codex/skills" on
     gosu "$TARGET_USER" env HOME="$user_home" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
         SHELL="$user_shell" DEVCAR_TOOLING="$TOOLING_DIR" \
         bash "$SCRIPT_DIR/link-skills.sh" "$user_home/.claude/skills" on
