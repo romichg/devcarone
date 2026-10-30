@@ -60,8 +60,10 @@ class HostToolchainParityTests(unittest.TestCase):
 REAL_COMMANDS = """
     awk basename bash cat chmod cmp cp cut date dirname env find getent grep head
     id install jq ln ls mkdir mktemp mv od python3 readlink rm sed sha256sum sleep
-    sort stat tar touch tr true uniq wc xz
+    sort stat touch tr true uniq wc xz
 """.split()
+# Real utilities whose arguments tests inspect.
+LOGGED_REAL_COMMANDS = ("tar",)
 
 LOGGED = 'printf "%s\\n" "${0##*/} $*" >> "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/commands.log"\n'
 
@@ -154,6 +156,7 @@ class InstallerRoot:
     """A marked temporary system root with substitute commands and responses."""
 
     node_version = "24.0.0"
+    node_archive_mode = 0o755
 
     def __init__(self, directory):
         self.root = Path(directory)
@@ -187,6 +190,10 @@ class InstallerRoot:
             if real is None:
                 raise unittest.SkipTest(f"{name} is required for installer tests")
             (self.root / "test-bin" / name).symlink_to(real)
+        for name in LOGGED_REAL_COMMANDS:
+            real = shutil.which(name, path="/usr/bin:/bin")
+            self.write(f"test-bin/{name}",
+                       f'#!/usr/bin/env bash\n{LOGGED}exec {real} "$@"\n', 0o755)
         for name, body in SUBSTITUTES.items():
             self.write(f"test-bin/{name}", "#!/usr/bin/env bash\n" + LOGGED + body, 0o755)
 
@@ -202,7 +209,7 @@ class InstallerRoot:
     def _respond_to_known_releases(self):
         node_url = f"https://nodejs.org/dist/v{self.node_version}"
         tarball_name = f"node-v{self.node_version}-linux-x64.tar.xz"
-        tarball = self.node_archive()
+        tarball = self.node_archive(mode=self.node_archive_mode)
         self.respond("https://nodejs.org/dist/index.json",
                      json.dumps([{"version": f"v{self.node_version}", "lts": "Test"}]))
         self.respond(f"{node_url}/{tarball_name}", tarball)
@@ -221,14 +228,14 @@ class InstallerRoot:
         self.respond("https://api.github.com/repos/mattpocock/skills/commits/main",
                      json.dumps({"sha": "a" * 40}))
 
-    def node_archive(self, owner=0):
+    def node_archive(self, owner=1001, mode=0o755):
         files = {"bin/node": "#!/bin/sh\n", "bin/npm": FAKE_NPM, "bin/npx": "#!/bin/sh\n"}
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w:xz") as archive:
             for name, content in files.items():
                 data = content.encode()
                 info = tarfile.TarInfo(f"node-v{self.node_version}-linux-x64/{name}")
-                info.size, info.mode, info.uid, info.gid = len(data), 0o755, owner, owner
+                info.size, info.mode, info.uid, info.gid = len(data), mode, owner, owner
                 archive.addfile(info, io.BytesIO(data))
         return buffer.getvalue()
 
@@ -285,6 +292,49 @@ class HostInstallerBehaviorTests(unittest.TestCase):
         self.assertIn(" code", install[0])
         self.assertIn("System tools installed.", result.stdout)
         self.assertEqual(list((root / "tmp").iterdir()), [])
+
+    def node_release(self):
+        return (self.system.root / "usr/local/lib/devcarone-toolchain/node"
+                / self.system.node_version)
+
+    def test_node_archive_owner_and_writable_modes_are_not_kept(self):
+        self.system.node_archive_mode = 0o777
+        self.system._respond_to_known_releases()
+
+        self.assertSucceeded(self.system.run())
+
+        extraction = [line for line in self.system.commands() if line.startswith("tar ")]
+        self.assertEqual(len(extraction), 1)
+        self.assertIn("--no-same-owner --no-same-permissions", extraction[0])
+        node = self.node_release() / "bin/node"
+        self.assertEqual(node.stat().st_uid, os.getuid())
+        self.assertEqual(node.stat().st_mode & 0o022, 0)
+
+    def test_update_replaces_recorded_release_that_others_can_modify(self):
+        self.assertSucceeded(self.system.run())
+        release = self.node_release()
+        (release / "bin/node").chmod(0o777)
+        (release / "planted").write_text("")
+
+        result = self.system.run("--update")
+
+        self.assertSucceeded(result)
+        self.assertIn("Replacing Node", result.stderr)
+        self.assertFalse((release / "planted").exists())
+        self.assertEqual((release / "bin/node").stat().st_mode & 0o022, 0)
+        self.assertEqual(sorted(path.name for path in release.parent.iterdir()),
+                         [self.system.node_version])
+        self.assertEqual(os.readlink(self.system.root / "usr/local/bin/node"),
+                         f"{release.parent.parent}/current-node/bin/node")
+
+    def test_recorded_release_that_others_can_modify_is_reported(self):
+        self.assertSucceeded(self.system.run())
+        (self.node_release() / "bin/node").chmod(0o777)
+
+        result = self.system.run()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rerun with --update to replace it", result.stderr)
 
     def test_unmarked_test_root_is_refused(self):
         (self.system.root / ".devcarone-host-toolchain-test-root").unlink()

@@ -45,7 +45,9 @@ gogcli, or Plannotator commands
 without this installer's ownership record cause the run to stop.
 
 Node's archive is checked against a GPG signed release manifest and the
-allowed Node signer fingerprints in the script. npm packages are staged with
+allowed Node signer fingerprints in the script. It is extracted with root
+ownership; a recorded Node release that other accounts can modify is reported,
+and `--update` replaces it. npm packages are staged with
 lifecycle scripts disabled, checked with `npm audit signatures` against the
 public npm registry, then rebuilt and exposed on `PATH`. tea's checksum file
 must be signed by the committed Gitea key. Plannotator must carry Sigstore SLSA

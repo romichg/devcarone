@@ -301,6 +301,17 @@ done
 managed_binary "$BIN_DIR/tea" "$STATE_DIR/tea.sha256"
 managed_binary "$BIN_DIR/gog" "$STATE_DIR/gog.sha256"
 managed_binary "$BIN_DIR/plannotator" "$STATE_DIR/plannotator.sha256"
+# Node archives record a non-root owner, which releases extracted by earlier
+# installer versions kept. Never run such a tree as root.
+untrusted_file() {
+    find "$1" ! -type l \( ! -uid "$OWNER_UID" -o -perm /022 \) -print -quit
+}
+if [[ -f $STATE_DIR/node-version ]]; then
+    recorded_node=$TOOL_DIR/node/$(cat "$STATE_DIR/node-version")
+    if [[ -d $recorded_node && -n $(untrusted_file "$recorded_node") ]]; then
+        warn "Non-root accounts can modify $recorded_node; rerun with --update to replace it."
+    fi
+fi
 
 INSTALL_MANAGED=1
 if [[ -e $STATE_DIR/node-version || -e $STATE_DIR/npm-generation || \
@@ -343,7 +354,7 @@ node_hash=$(awk -v file="$node_tarball" '$2 == file { print $1 }' "$node_dir/SHA
 printf '%s  %s\n' "$node_hash" "$node_dir/$node_tarball" | sha256sum -c - >/dev/null || die 'Node tarball hash failed.'
 node_stage=$WORK/node-stage
 mkdir "$node_stage"
-tar -xJf "$node_dir/$node_tarball" -C "$node_stage" --strip-components=1
+tar --no-same-owner --no-same-permissions -xJf "$node_dir/$node_tarball" -C "$node_stage" --strip-components=1
 [[ -x $node_stage/bin/node && -f $node_stage/bin/npm ]] || die 'Node archive has unexpected contents.'
 
 NPM_PACKAGES=(
@@ -377,10 +388,17 @@ for binary in "$node_stage"/bin/*; do
     managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-node/bin/$name"
 done
 
-if [[ -e $TOOL_DIR/node/$node_version ]]; then
+node_release=$TOOL_DIR/node/$node_version
+if [[ -e $node_release ]]; then
     [[ -f $STATE_DIR/node-version && $(cat "$STATE_DIR/node-version") == "$node_version" ]] || die 'Unmanaged Node release directory exists.'
+    if [[ -n $(untrusted_file "$node_release") ]]; then
+        warn "Replacing Node $node_version files that non-root accounts could modify."
+        mv -T -- "$node_release" "$node_release.untrusted.$$"
+        mv -- "$node_stage" "$node_release"
+        rm -rf -- "$node_release.untrusted.$$"
+    fi
 else
-    mv -- "$node_stage" "$TOOL_DIR/node/$node_version"
+    mv -- "$node_stage" "$node_release"
 fi
 npm_generation=$(date -u +%Y%m%dT%H%M%SZ)-$$
 mv -- "$npm_stage" "$TOOL_DIR/npm/$npm_generation"
