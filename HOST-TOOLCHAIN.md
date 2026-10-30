@@ -77,7 +77,8 @@ address family.
 The latest tea, Plannotator, and gogcli releases are attempted first. If
 release metadata or the required verifiable artifact is unavailable, the
 script warns and tries the Dockerfile's known version. A bad signature,
-checksum, provenance bundle, or unrecognized signer stops the run. An
+checksum, provenance bundle or attestation response, or unrecognized signer
+stops the run. An
 unrecognized future signing key requires a reviewed update to this bundle's
 trust data; downloading a new key from the same release server would not
 authenticate it. A fallback never replaces a newer verified installation.

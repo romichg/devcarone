@@ -1,4 +1,5 @@
 """Keep the standalone installer aligned with the image and test its behavior."""
+import base64
 import hashlib
 import io
 import json
@@ -160,7 +161,17 @@ response=$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/responses/$(printf %s "$url" | sha256s
 [[ -f $response ]] || exit 22
 if [[ -n $output ]]; then cp -- "$response" "$output"; else cat -- "$response"; fi
 ''',
-    "go": 'printf "#!/bin/sh\\necho gog\\n" > "$GOBIN/gog"\nchmod 755 "$GOBIN/gog"\n',
+    # go/<tag> may say "unavailable" or "invalid"; otherwise the build succeeds.
+    "go": '''
+tag=${@: -1}
+tag=${tag##*@}
+case $(cat "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/go/$tag" 2>/dev/null) in
+    unavailable) echo "go: github.com/openclaw/gogcli@$tag: unknown revision $tag" >&2; exit 1 ;;
+    invalid) echo "verifying module: checksum mismatch" >&2; exit 1 ;;
+esac
+printf '#!/bin/sh\\necho gog %s\\n' "$tag" > "$GOBIN/gog"
+chmod 755 "$GOBIN/gog"
+''',
     "gosu": 'shift\nexec "$@"\n',
 }
 
@@ -230,7 +241,54 @@ class InstallerRoot:
         return path
 
     def respond(self, url, content):
-        self.write(f"responses/{hashlib.sha256(url.encode()).hexdigest()}", content)
+        path = f"responses/{hashlib.sha256(url.encode()).hexdigest()}"
+        if content is None:
+            (self.root / path).unlink(missing_ok=True)
+        else:
+            self.write(path, content)
+
+    def tea_release(self, tag, files=True, signer=None):
+        """Publish TAG as tea's latest release, optionally without its files."""
+        asset = f"tea-{tag[1:]}-linux-amd64"
+        self.respond("https://gitea.com/api/v1/repos/gitea/tea/releases/latest", json.dumps({
+            "tag_name": tag,
+            "assets": [{"name": name} for name in (asset, "checksums.txt", "checksums.txt.sig")],
+        }))
+        binary = f"#!/bin/sh\necho tea {tag}\n".encode()
+        url = f"https://gitea.com/gitea/tea/releases/download/{tag}"
+        self.respond(f"{url}/{asset}", binary if files else None)
+        self.respond(f"{url}/checksums.txt",
+                     f"{hashlib.sha256(binary).hexdigest()}  {asset}\n" if files else None)
+        self.respond(f"{url}/checksums.txt.sig",
+                     (signer or installer_value("TEA_KEY")) if files else None)
+        return binary
+
+    def plannotator_release(self, tag, binary=True, attestation="valid"):
+        """Publish TAG as Plannotator's latest; attestation: valid, none, malformed, or None."""
+        asset = "plannotator-linux-x64"
+        content = f"plannotator {tag}".encode()
+        self.respond("https://api.github.com/repos/backnotprop/plannotator/releases/latest",
+                     json.dumps({"tag_name": tag, "assets": [{"name": asset}]}))
+        self.respond(f"https://github.com/backnotprop/plannotator/releases/download/{tag}/{asset}",
+                     content if binary else None)
+        payload = base64.b64encode(json.dumps(
+            {"predicateType": "https://slsa.dev/provenance/v1"}).encode()).decode()
+        body = {
+            "valid": json.dumps({"attestations": [{"bundle": {"dsseEnvelope": {"payload": payload}}}]}),
+            "none": json.dumps({"attestations": []}),
+            "malformed": "{not json",
+            None: None,
+        }[attestation]
+        self.respond("https://api.github.com/repos/backnotprop/plannotator/attestations/sha256:"
+                     + hashlib.sha256(content).hexdigest(), body)
+
+    def gog_release(self, tag, result="available"):
+        self.respond("https://api.github.com/repos/openclaw/gogcli/releases/latest",
+                     json.dumps({"tag_name": tag}))
+        self.write(f"go/{tag}", result)
+
+    def tooling_tags(self):
+        return [line.split()[2] for line in self.commands() if line.startswith("install-tooling.sh ")]
 
     def _install_commands(self):
         for name in REAL_COMMANDS:
@@ -546,6 +604,149 @@ class HostInstallerAptConsentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("would remove vim-tiny", result.stderr)
         self.assertEqual(self.system.installed("vim-tiny"), "1.0")
+
+
+class HostInstallerReleaseTests(unittest.TestCase):
+    """Unavailable latest artifacts fall back; invalid ones stop the run."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.system = InstallerRoot(directory.name)
+        self.state = self.system.root / "var/lib/devcarone-host-toolchain"
+        self.tea_known = installer_value("TEA_KNOWN")
+        self.plannotator_known = installer_value("PLANNOTATOR_KNOWN")
+        self.gog_known = installer_value("GOG_KNOWN")
+
+    def run_ok(self, *arguments):
+        result = self.system.run(*arguments)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
+
+    def recorded(self, name):
+        path = self.state / f"{name}.version"
+        return path.read_text().strip() if path.exists() else None
+
+    def test_unavailable_latest_tea_download_uses_known_release(self):
+        self.system.tea_release("v9.0.0", files=False)
+
+        result = self.run_ok()
+
+        self.assertIn("Latest tea v9.0.0 artifacts are unavailable; using " + self.tea_known,
+                      result.stderr)
+        self.assertEqual(self.recorded("tea"), self.tea_known)
+
+    def test_invalid_latest_tea_signature_stops_the_run(self):
+        self.system.tea_release("v9.0.0", signer="BAD")
+
+        result = self.system.run()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("tea checksum signature failed", result.stderr)
+        self.assertIsNone(self.recorded("tea"))
+        self.assertFalse((self.system.root / "usr/local/bin/tea").exists())
+
+    def test_unrecognized_latest_tea_signer_stops_the_run(self):
+        self.system.tea_release("v9.0.0", signer="0" * 40)
+
+        result = self.system.run()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Unexpected tea signer", result.stderr)
+
+    def test_unavailable_known_tea_release_fails_clearly(self):
+        self.system.tea_release("v9.0.0", files=False)
+        url = f"https://gitea.com/gitea/tea/releases/download/{self.tea_known}/checksums.txt"
+        self.system.respond(url, None)
+
+        result = self.system.run()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"Could not obtain tea {self.tea_known}", result.stderr)
+
+    def test_unavailable_latest_plannotator_artifacts_use_known_release(self):
+        for binary, attestation in ((False, "valid"), (True, None), (True, "none")):
+            with self.subTest(binary=binary, attestation=attestation):
+                system = InstallerRoot(tempfile.mkdtemp(dir=self.system.root / "tmp"))
+                system.plannotator_release("v9.0.0", binary=binary, attestation=attestation)
+
+                result = system.run()
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Latest plannotator v9.0.0 artifacts are unavailable", result.stderr)
+                self.assertEqual(system.tooling_tags(), [self.plannotator_known])
+
+    def test_available_latest_plannotator_is_installed(self):
+        self.system.plannotator_release("v9.0.0")
+
+        self.run_ok()
+
+        self.assertEqual(self.system.tooling_tags(), ["v9.0.0"])
+        self.assertEqual(self.recorded("plannotator"), "v9.0.0")
+
+    def test_invalid_plannotator_attestation_response_stops_the_run(self):
+        self.system.plannotator_release("v9.0.0", attestation="malformed")
+
+        result = self.system.run()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Plannotator v9.0.0 attestation response is invalid", result.stderr)
+        self.assertEqual(self.system.tooling_tags(), [])
+
+    def test_unavailable_latest_gogcli_uses_known_and_invalid_module_stops(self):
+        self.system.gog_release("v9.0.0", "unavailable")
+        self.run_ok()
+        self.assertEqual(self.recorded("gog"), self.gog_known)
+
+        self.system.gog_release("v9.1.0", "invalid")
+        result = self.system.run("--update")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("gogcli v9.1.0 Go checksum database or build failed", result.stderr)
+        self.assertEqual(self.recorded("gog"), self.gog_known)
+
+    def test_newer_verified_release_is_retained_only_against_older_candidates(self):
+        self.system.tea_release("v9.0.0")
+        self.run_ok()
+        self.assertEqual(self.recorded("tea"), "v9.0.0")
+        tea = self.system.root / "usr/local/bin/tea"
+        installed = tea.read_bytes()
+
+        # Equal version: reinstalled without a retention warning.
+        result = self.run_ok("--update")
+        self.assertNotIn("Keeping newer verified tea", result.stderr)
+
+        # Older candidate from unavailable metadata: keep the newer release.
+        self.system.respond("https://gitea.com/api/v1/repos/gitea/tea/releases/latest", None)
+        result = self.run_ok("--update")
+        self.assertIn("Keeping newer verified tea v9.0.0", result.stderr)
+        self.assertEqual(tea.read_bytes(), installed)
+
+        # Fallback after unavailable artifacts also keeps the newer release.
+        self.system.tea_release("v9.1.0", files=False)
+        result = self.run_ok("--update")
+        self.assertIn("Latest tea v9.1.0 artifacts are unavailable", result.stderr)
+        self.assertIn("Keeping newer verified tea v9.0.0", result.stderr)
+        self.assertEqual(self.recorded("tea"), "v9.0.0")
+
+        # Newer candidate replaces it.
+        self.system.tea_release("v9.2.0")
+        self.run_ok("--update")
+        self.assertEqual(self.recorded("tea"), "v9.2.0")
+
+    def test_fallback_retains_newer_plannotator_and_gogcli(self):
+        self.system.plannotator_release("v9.0.0")
+        self.system.gog_release("v9.0.0")
+        self.run_ok()
+
+        self.system.plannotator_release("v9.1.0", binary=False)
+        self.system.gog_release("v9.1.0", "unavailable")
+        result = self.run_ok("--update")
+
+        self.assertIn("Keeping newer verified plannotator v9.0.0", result.stderr)
+        self.assertIn("Keeping newer verified gog v9.0.0", result.stderr)
+        self.assertEqual(self.recorded("plannotator"), "v9.0.0")
+        self.assertEqual(self.recorded("gog"), "v9.0.0")
+        self.assertEqual(self.system.tooling_tags(), ["v9.0.0"])
 
 
 class HostInstallerBehaviorTests(unittest.TestCase):

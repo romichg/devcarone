@@ -589,8 +589,8 @@ printf '%s\n' "$npm_generation" > "$STATE_DIR/npm-generation"
 PATH=$BIN_DIR:$SYSTEM_PATH npm cache clean --force
 
 # Metadata selects a release; cryptographic verification below decides whether
-# its bytes may be installed. Malformed or unavailable metadata uses the known
-# Dockerfile version. An invalid signature or hash always stops the run.
+# its bytes may be installed. Unavailable metadata or artifacts use the known
+# Dockerfile version. An invalid signature, hash, or provenance stops the run.
 latest_tag() {
     local url=$1 destination=$2 tag
     if ! curl -fsSL --retry 3 "$url" -o "$destination"; then return 1; fi
@@ -607,75 +607,88 @@ select_tag() {
         printf '%s\n' "$known"
     fi
 }
-older_than() {
-    local left=$1 right=$2
-    [[ $left != "$right" && $(printf '%s\n%s\n' "$left" "$right" | sort -V | head -n 1) == "$left" ]]
+# Succeed, with a warning, when TAG is older than NAME's recorded verified release.
+keep_newer() {
+    local name=$1 tag=$2 recorded
+    [[ -f $STATE_DIR/$name.version ]] || return 1
+    recorded=$(cat "$STATE_DIR/$name.version")
+    [[ $tag != "$recorded" && $(printf '%s\n%s\n' "$tag" "$recorded" | sort -V | head -n 1) == "$tag" ]] || return 1
+    warn "Keeping newer verified $name $recorded."
+}
+# Run FETCH for TAG, or for KNOWN if TAG's artifacts are unavailable. FETCH
+# returns 1 only for unavailable artifacts and stops the run on invalid ones.
+# Print the fetched tag, or nothing when a newer verified release is kept.
+fetch_release() {
+    local name=$1 tag=$2 known=$3 fetch=$4
+    keep_newer "$name" "$tag" && return 0
+    if "$fetch" "$tag"; then
+        printf '%s\n' "$tag"
+        return 0
+    fi
+    [[ $tag != "$known" ]] || die "Could not obtain $name $known."
+    warn "Latest $name $tag artifacts are unavailable; using $known."
+    keep_newer "$name" "$known" && return 0
+    "$fetch" "$known" || die "Could not obtain $name $known."
+    printf '%s\n' "$known"
 }
 
+fetch_tea() {
+    local tag=$1 file
+    if [[ $tag != "$TEA_KNOWN" ]] && ! jq -e --arg name "tea-${tag#v}-linux-amd64" \
+        '[(.assets // [])[].name] as $names |
+            ($names | index($name) != null) and
+            ($names | index("checksums.txt") != null) and
+            ($names | index("checksums.txt.sig") != null)' "$WORK/tea-release.json" >/dev/null; then
+        return 1
+    fi
+    mkdir -p "$WORK/tea-$tag"
+    for file in checksums.txt checksums.txt.sig "tea-${tag#v}-linux-amd64"; do
+        curl -fsSL --retry 3 "https://gitea.com/gitea/tea/releases/download/$tag/$file" \
+            -o "$WORK/tea-$tag/$file" || return 1
+    done
+}
 tea_tag=$(select_tag tea https://gitea.com/api/v1/repos/gitea/tea/releases/latest "$TEA_KNOWN" "$WORK/tea-release.json")
-if [[ $tea_tag != "$TEA_KNOWN" ]] && ! jq -e --arg name "tea-${tea_tag#v}-linux-amd64" \
-    '[(.assets // [])[].name] as $names |
-        ($names | index($name) != null) and
-        ($names | index("checksums.txt") != null) and
-        ($names | index("checksums.txt.sig") != null)' "$WORK/tea-release.json" >/dev/null; then
-    warn "Latest tea release has no Linux amd64 asset; using $TEA_KNOWN."
-    tea_tag=$TEA_KNOWN
-fi
-tea_skip=0
-if [[ -f $STATE_DIR/tea.version ]] && \
-    older_than "$tea_tag" "$(cat "$STATE_DIR/tea.version")"; then
-    warn "Keeping newer verified tea $(cat "$STATE_DIR/tea.version")."
-    tea_skip=1
-fi
-if ((!tea_skip)); then
+tea_tag=$(fetch_release tea "$tea_tag" "$TEA_KNOWN" fetch_tea)
+if [[ -n $tea_tag ]]; then
+tea_dir=$WORK/tea-$tea_tag
 tea_asset=tea-${tea_tag#v}-linux-amd64
-tea_url=https://gitea.com/gitea/tea/releases/download/$tea_tag
-for file in checksums.txt checksums.txt.sig "$tea_asset"; do
-    curl -fsSL --retry 3 "$tea_url/$file" -o "$WORK/$file" || die "Could not download tea $file for $tea_tag"
-done
 gpg --batch --quiet --import "$SCRIPT_DIR/keys/teabot.asc"
-gpg --batch --status-fd 1 --verify "$WORK/checksums.txt.sig" "$WORK/checksums.txt" \
+gpg --batch --status-fd 1 --verify "$tea_dir/checksums.txt.sig" "$tea_dir/checksums.txt" \
     > "$WORK/tea-gpg-status" || die 'tea checksum signature failed.'
 grep -q "^\[GNUPG:\] VALIDSIG .* ${TEA_KEY}\$" "$WORK/tea-gpg-status" || die 'Unexpected tea signer.'
-tea_hash=$(awk -v file="$tea_asset" '$2 == file { print $1 }' "$WORK/checksums.txt")
+tea_hash=$(awk -v file="$tea_asset" '$2 == file { print $1 }' "$tea_dir/checksums.txt")
 [[ $tea_hash =~ ^[a-fA-F0-9]{64}$ ]] || die 'tea asset is absent from its signed checksum list.'
-printf '%s  %s\n' "$tea_hash" "$WORK/$tea_asset" | sha256sum -c - >/dev/null || die 'tea checksum failed.'
-install -m 755 "$WORK/$tea_asset" "$BIN_DIR/tea"
+printf '%s  %s\n' "$tea_hash" "$tea_dir/$tea_asset" | sha256sum -c - >/dev/null || die 'tea checksum failed.'
+install -m 755 "$tea_dir/$tea_asset" "$BIN_DIR/tea"
 sha256sum "$BIN_DIR/tea" | awk '{print $1}' > "$STATE_DIR/tea.sha256"
 printf '%s\n' "$tea_tag" > "$STATE_DIR/tea.version"
 fi
 
+# The tooling installer downloads and verifies the known release itself; a newer
+# release must first show that its Linux binary and SLSA provenance exist.
+fetch_plannotator() {
+    local tag=$1 asset=plannotator-linux-x64 digest status=0
+    [[ $tag != "$PLANNOTATOR_KNOWN" ]] || return 0
+    jq -e --arg name "$asset" '[(.assets // [])[].name] | index($name) != null' \
+        "$WORK/plannotator-release.json" >/dev/null || return 1
+    curl -fsSL --retry 3 \
+        "https://github.com/backnotprop/plannotator/releases/download/$tag/$asset" \
+        -o "$WORK/plannotator-probe" || return 1
+    digest=$(sha256sum "$WORK/plannotator-probe" | awk '{print $1}')
+    curl -fsSL --retry 3 \
+        "https://api.github.com/repos/backnotprop/plannotator/attestations/sha256:$digest" \
+        -o "$WORK/plannotator-probe-attestations.json" || return 1
+    jq -e '[.attestations[].bundle | select(.dsseEnvelope.payload | @base64d | fromjson
+        | .predicateType == "https://slsa.dev/provenance/v1")] | length > 0' \
+        "$WORK/plannotator-probe-attestations.json" >/dev/null || status=$?
+    # jq -e exits 1 for a false result and higher for unreadable data.
+    ((status != 1)) || return 1
+    ((status == 0)) || die "Plannotator $tag attestation response is invalid."
+}
 plannotator_tag=$(select_tag plannotator https://api.github.com/repos/backnotprop/plannotator/releases/latest \
     "$PLANNOTATOR_KNOWN" "$WORK/plannotator-release.json")
-if [[ $plannotator_tag != "$PLANNOTATOR_KNOWN" ]]; then
-    plannotator_asset=plannotator-linux-x64
-    if ! jq -e --arg name "$plannotator_asset" \
-        '[(.assets // [])[].name] | index($name) != null' "$WORK/plannotator-release.json" >/dev/null; then
-        warn "Latest Plannotator release has no Linux x64 asset; using $PLANNOTATOR_KNOWN."
-        plannotator_tag=$PLANNOTATOR_KNOWN
-    else
-        curl -fsSL --retry 3 \
-            "https://github.com/backnotprop/plannotator/releases/download/$plannotator_tag/$plannotator_asset" \
-            -o "$WORK/plannotator-probe" || die 'Could not download latest Plannotator asset.'
-        probe_hash=$(sha256sum "$WORK/plannotator-probe" | awk '{print $1}')
-        if ! curl -fsSL --retry 3 \
-            "https://api.github.com/repos/backnotprop/plannotator/attestations/sha256:$probe_hash" \
-            -o "$WORK/plannotator-probe-attestations.json" || \
-            ! jq -e '[.attestations[].bundle | select(.dsseEnvelope.payload | @base64d | fromjson
-                | .predicateType == "https://slsa.dev/provenance/v1")] | length > 0' \
-                "$WORK/plannotator-probe-attestations.json" >/dev/null; then
-            warn "Latest Plannotator release has no SLSA provenance; using $PLANNOTATOR_KNOWN."
-            plannotator_tag=$PLANNOTATOR_KNOWN
-        fi
-    fi
-fi
-plannotator_skip=0
-if [[ -f $STATE_DIR/plannotator.version ]] && \
-    older_than "$plannotator_tag" "$(cat "$STATE_DIR/plannotator.version")"; then
-    warn "Keeping newer verified Plannotator $(cat "$STATE_DIR/plannotator.version")."
-    plannotator_skip=1
-fi
-if ((!plannotator_skip)); then
+plannotator_tag=$(fetch_release plannotator "$plannotator_tag" "$PLANNOTATOR_KNOWN" fetch_plannotator)
+if [[ -n $plannotator_tag ]]; then
 tooling_stage=$WORK/tooling-stage
 mkdir "$tooling_stage"
 matt_commit_json=$WORK/matt-commit.json
@@ -695,13 +708,6 @@ fi
 
 gog_tag=$(select_tag gogcli https://api.github.com/repos/openclaw/gogcli/releases/latest \
     "$GOG_KNOWN" "$WORK/gog-release.json")
-gog_skip=0
-if [[ -f $STATE_DIR/gog.version ]] && \
-    older_than "$gog_tag" "$(cat "$STATE_DIR/gog.version")"; then
-    warn "Keeping newer verified gogcli $(cat "$STATE_DIR/gog.version")."
-    gog_skip=1
-fi
-if ((!gog_skip)); then
 mkdir "$WORK/go" "$WORK/go-cache" "$WORK/go-bin"
 proxy_token=$(od -An -N24 -tx1 /dev/urandom | tr -d '[:space:]')
 DEVCAR_GO_PROXY_TOKEN=$proxy_token python3 "$SCRIPT_DIR/go-ipv4-proxy.py" \
@@ -716,33 +722,21 @@ done
 proxy_port=$(cat "$WORK/go-proxy-port")
 [[ $proxy_port =~ ^[0-9]+$ ]] || die 'IPv4 proxy returned an invalid port.'
 proxy_url=http://go:$proxy_token@127.0.0.1:$proxy_port
-run_go_install() {
+# Go's checksum database verifies the module; a missing release is unavailable,
+# any other failure stops the run.
+fetch_gog() {
     GOPATH=$WORK/go GOCACHE=$WORK/go-cache GOBIN=$WORK/go-bin \
         GOTOOLCHAIN=auto GOSUMDB=sum.golang.org GOPROXY=https://proxy.golang.org \
         GONOSUMDB= GOPRIVATE= GONOPROXY= GOINSECURE= GOFLAGS=-modcacherw \
         HTTPS_PROXY=$proxy_url https_proxy=$proxy_url HTTP_PROXY= http_proxy= \
-        NO_PROXY= no_proxy= go install "github.com/openclaw/gogcli/cmd/gog@$1"
+        NO_PROXY= no_proxy= go install "github.com/openclaw/gogcli/cmd/gog@$1" \
+        2> "$WORK/gog-error" && return 0
+    sed "s/$proxy_token/<REDACTED>/g" "$WORK/gog-error" >&2
+    grep -Eq 'unknown revision|404 Not Found' "$WORK/gog-error" && return 1
+    die "gogcli $1 Go checksum database or build failed."
 }
-run_go_install "$gog_tag" 2> "$WORK/gog-error" || {
-        if [[ $gog_tag != "$GOG_KNOWN" ]] && grep -Eq 'unknown revision|404 Not Found' "$WORK/gog-error"; then
-            warn "Latest gogcli release has no verifiable Go module; using $GOG_KNOWN."
-            gog_tag=$GOG_KNOWN
-            if [[ -f $STATE_DIR/gog.version ]] && \
-                older_than "$gog_tag" "$(cat "$STATE_DIR/gog.version")"; then
-                warn "Keeping newer verified gogcli $(cat "$STATE_DIR/gog.version")."
-                gog_skip=1
-            else
-                if ! run_go_install "$gog_tag" 2> "$WORK/gog-known-error"; then
-                    sed "s/$proxy_token/<REDACTED>/g" "$WORK/gog-known-error" >&2
-                    die 'Known gogcli version failed Go verification or build.'
-                fi
-            fi
-        else
-            sed "s/$proxy_token/<REDACTED>/g" "$WORK/gog-error" >&2
-            die 'gogcli Go checksum database or build failed.'
-        fi
-    }
-if ((!gog_skip)); then
+gog_tag=$(fetch_release gog "$gog_tag" "$GOG_KNOWN" fetch_gog)
+if [[ -n $gog_tag ]]; then
 install -m 755 "$WORK/go-bin/gog" "$BIN_DIR/gog"
 sha256sum "$BIN_DIR/gog" | awk '{print $1}' > "$STATE_DIR/gog.sha256"
 printf '%s\n' "$gog_tag" > "$STATE_DIR/gog.version"
@@ -750,7 +744,6 @@ fi
 kill "$GO_PROXY_PID" 2>/dev/null || true
 wait "$GO_PROXY_PID" 2>/dev/null || true
 GO_PROXY_PID=
-fi
 fi
 
 if [[ -n $TARGET_USER ]]; then
