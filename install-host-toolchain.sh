@@ -1,0 +1,581 @@
+#!/usr/bin/env bash
+# Install the Dockerfile's toolchain on Debian Trixie, without its container runtime.
+set -euo pipefail
+umask 022
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin
+export DEBIAN_FRONTEND=noninteractive
+
+readonly SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly STATE_DIR=/var/lib/devcarone-host-toolchain
+readonly TOOL_DIR=/usr/local/lib/devcarone-toolchain
+readonly TOOLING_DIR=/opt/devcar/tooling
+readonly NPM_REGISTRY=https://registry.npmjs.org/
+readonly TEA_KNOWN=v0.16.0 PLANNOTATOR_KNOWN=v0.27.21 GOG_KNOWN=v0.43.0
+
+UPDATE=0
+TARGET_USER=
+while (($#)); do
+    case $1 in
+        --update) UPDATE=1 ;;
+        --user)
+            (($# >= 2)) || { echo '--user needs an account name.' >&2; exit 2; }
+            TARGET_USER=$2
+            shift ;;
+        --help|-h)
+            echo 'Usage: sudo ./install-host-toolchain.sh [--update] [--user NAME]'
+            echo 'Run from the public/ bundle on Debian Trixie x86_64.'
+            exit 0 ;;
+        *) echo "Unknown argument: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "WARNING: $*" >&2; }
+require_file() { [[ -f $1 ]] || die "Missing bundle file $1"; }
+require_file "$SCRIPT_DIR/keys/nodejs-release.asc"
+require_file "$SCRIPT_DIR/keys/teabot.asc"
+require_file "$SCRIPT_DIR/microsoft.asc.gpg"
+require_file "$SCRIPT_DIR/install-tooling.sh"
+require_file "$SCRIPT_DIR/link-skills.sh"
+require_file "$SCRIPT_DIR/configure-codex.py"
+require_file "$SCRIPT_DIR/configure-claude.py"
+require_file "$SCRIPT_DIR/go-ipv4-proxy.py"
+[[ $(id -u) == 0 ]] || die 'Run as root (usually with sudo).'
+# Do not try to adapt this image's x64 packages to another platform.
+[[ $(dpkg --print-architecture) == amd64 ]] || die 'Debian amd64 is required.'
+# shellcheck source=/dev/null
+. /etc/os-release
+[[ ${ID:-} == debian && ${VERSION_CODENAME:-} == trixie ]] || die 'Debian Trixie is required.'
+for command_name in node npm codex copilot opencode pi claude firebase playwright tea gog plannotator; do
+    command_path=$(command -v "$command_name" || true)
+    if [[ -n $command_path && $command_path != /usr/local/bin/$command_name ]]; then
+        die "Unmanaged $command_name command is already on PATH at $command_path"
+    fi
+    if [[ $command_path == /usr/local/bin/$command_name && ! -d $STATE_DIR ]]; then
+        die "Unmanaged $command_name command is already installed at $command_path"
+    fi
+done
+for command_name in code chromium; do
+    command_path=$(command -v "$command_name" || true)
+    if [[ -n $command_path && $command_path != /usr/bin/$command_name && \
+          $command_path != /bin/$command_name ]]; then
+        die "Unmanaged $command_name command is already on PATH at $command_path"
+    fi
+done
+
+if [[ -z $TARGET_USER && -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+    TARGET_USER=$SUDO_USER
+fi
+if [[ -n $TARGET_USER ]]; then
+    id "$TARGET_USER" >/dev/null 2>&1 || die "Unknown account: $TARGET_USER"
+    [[ $(id -u "$TARGET_USER") != 0 ]] || die 'Select a non-root account for agent configuration.'
+fi
+
+WORK=$(mktemp -d)
+GO_PROXY_PID=
+cleanup() {
+    if [[ -n $GO_PROXY_PID ]]; then
+        kill "$GO_PROXY_PID" 2>/dev/null || true
+        wait "$GO_PROXY_PID" 2>/dev/null || true
+    fi
+    rm -rf -- "$WORK"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+export GNUPGHOME=$WORK/gnupg
+mkdir -m 700 "$GNUPGHOME"
+
+primary_fingerprints() {
+    gpg --show-keys --with-colons "$1" | awk -F: '$1 == "pub" { want = 1; next } $1 == "fpr" && want { print $10; want = 0 }'
+}
+
+verify_key_file() {
+    local file=$1 allowed=$2 key found=0
+    while IFS= read -r key; do
+        [[ -z $key ]] && continue
+        case " $allowed " in *" $key "*) ;; *) die "Unexpected key $key in $file" ;; esac
+        found=1
+    done < <(primary_fingerprints "$file")
+    ((found)) || die "No signing key in $file"
+}
+
+readonly DEBIAN_KEYS='04B54C3CDCA79751B16BC6B5225629DF75B188BD 5E04A1E3223A19A20706E20F9904613D4CCE68C6 41587F7DB8C774BCCF131416762F67A0B2C39DE4 B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8 05AB90340C0C5E797F44A8C8254CF3B5AEC0A8F0 4D64FEC119C2029067D6E791F8D2585B8783D481 1F89983E0081FDE018F3CC9673A4F27B8DD47936 AC530D520F2F3269F5E98313A48449044AAD5C5D A4285295FC7B1A81600062A9605C66F00D6C9793'
+readonly NODE_KEYS='5BE8A3F6C8A5C01D106C0AD820B1A390B168D356 DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7 CC68F5A3106FF448322E48ED27F5E38D5B0A215F 890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4 C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C 108F52B48DB57BB0CC439B2997B01419BD92F80A 655F3B5C1FB3FA8D1A0CA6BDE4A7D232B936D2FD A363A499291CBBC940DD62E41F10027AF002F8B0'
+readonly MICROSOFT_KEY=BC528686B50D79E339D3721CEB3E94ADBE1229CF
+readonly TEA_KEY=7C9E68152594688862D62AF62D9AE806EC1592E2
+
+# Apt authenticates the bootstrap packages before gpg/jq are available. On a
+# standard Trixie machine, debian.sources scopes apt to the Debian archive key.
+debian_signed_by=$(awk -F': ' '$1 == "Signed-By" { print $2 }' \
+    /etc/apt/sources.list.d/debian.sources | sort -u)
+case $debian_signed_by in
+    /usr/share/keyrings/debian-archive-keyring.pgp|/usr/share/keyrings/debian-archive-keyring.gpg) ;;
+    *) die 'Expected Debian Signed-By archive keyring is missing.' ;;
+esac
+[[ -f $debian_signed_by ]] || die "Missing Debian archive keyring $debian_signed_by"
+if [[ -s /etc/apt/sources.list ]]; then
+    die 'Additional apt sources in /etc/apt/sources.list need review before installation.'
+fi
+for source_file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [[ -e $source_file ]] || continue
+    case $source_file in
+        /etc/apt/sources.list.d/debian.sources|/etc/apt/sources.list.d/vscode.list) ;;
+        *) die "Additional apt source needs review: $source_file" ;;
+    esac
+done
+vscode_source='deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.asc.gpg] https://packages.microsoft.com/repos/code stable main'
+if [[ -e /etc/apt/sources.list.d/vscode.list ]]; then
+    [[ $(cat /etc/apt/sources.list.d/vscode.list) == "$vscode_source" ]] || \
+        die 'Existing VS Code apt source differs from the expected signed repository.'
+    [[ -f /usr/share/keyrings/microsoft.asc.gpg ]] && \
+        cmp -s "$SCRIPT_DIR/microsoft.asc.gpg" /usr/share/keyrings/microsoft.asc.gpg || \
+        die 'Existing Microsoft apt key differs from the trusted bundle.'
+fi
+vscode_pins=$'Package: code\nPin: origin packages.microsoft.com\nPin-Priority: 600\n\nPackage: *\nPin: origin packages.microsoft.com\nPin-Priority: -1'
+if [[ -e /etc/apt/preferences.d/devcarone-host-toolchain ]] && \
+    [[ $(cat /etc/apt/preferences.d/devcarone-host-toolchain) != "$vscode_pins" ]]; then
+    die 'Existing VS Code apt preferences differ from the installer policy.'
+fi
+printf '%s\n' "$vscode_pins" > /etc/apt/preferences.d/devcarone-host-toolchain
+if grep -E '^URIs: ' /etc/apt/sources.list.d/debian.sources | \
+    grep -Ev '^URIs: https?://(deb|security)\.debian\.org/(debian|debian-security)( |$)' >/dev/null; then
+    die 'Debian source contains an unexpected repository URI.'
+fi
+if ! grep -Eq '^Components: (.* )?non-free( |$)' /etc/apt/sources.list.d/debian.sources; then
+    sed -i 's/^Components: main$/Components: main contrib non-free non-free-firmware/' \
+        /etc/apt/sources.list.d/debian.sources
+fi
+apt-get update
+apt-get -y --no-install-recommends install ca-certificates curl gnupg jq xz-utils
+verify_key_file "$debian_signed_by" "$DEBIAN_KEYS"
+verify_key_file "$SCRIPT_DIR/microsoft.asc.gpg" "$MICROSOFT_KEY"
+verify_key_file "$SCRIPT_DIR/keys/nodejs-release.asc" "$NODE_KEYS"
+verify_key_file "$SCRIPT_DIR/keys/teabot.asc" "$TEA_KEY"
+
+install -m 644 "$SCRIPT_DIR/microsoft.asc.gpg" /usr/share/keyrings/microsoft.asc.gpg
+printf '%s\n' "$vscode_source" \
+    > /etc/apt/sources.list.d/vscode.list
+apt-get update
+
+APT_PACKAGES=(
+    sudo procps locales lsof file dialog gosu tzdata
+    curl wget ca-certificates apt-transport-https gnupg
+    net-tools netcat-traditional rsyslog logrotate
+    openssh-server rsync xauth tigervnc-standalone-server openbox tint2 feh x11-xserver-utils
+    rxvt-unicode pulseaudio mesa-utils vainfo libva2 intel-media-va-driver-non-free libpci3
+    fontconfig fonts-dejavu fonts-noto-core fonts-liberation
+    vim strace ripgrep jq unzip 7zip xz-utils poppler-utils fonts-noto ffmpeg imagemagick
+    pandoc texlive-xetex texlive-latex-base texlive-latex-recommended texlive-latex-extra lmodern
+    chromium build-essential git golang-go
+    python3 python3-pip python3-venv python3-pytest python3-yaml python3-tomlkit cosign code
+)
+
+# A matching name is not enough: the installed version must exist in the
+# expected signed apt repository. Debian packages may already be in a base OS.
+apt_origin_ok() {
+    local package=$1 version=$2 origin
+    if [[ $package == code ]]; then origin=packages.microsoft.com; else origin='debian.org'; fi
+    apt-cache policy "$package" | awk -v version="$version" -v origin="$origin" '
+        $1 == "***" && $2 == version { in_version = 1; next }
+        $1 == version { in_version = 1; next }
+        in_version && /^     [^ ]/ { in_version = 0 }
+        in_version && index($0, origin) { found = 1 }
+        END { exit !found }
+    '
+}
+
+APT_INSTALL=()
+APT_UPDATE=()
+for package in "${APT_PACKAGES[@]}"; do
+    installed=
+    if [[ $(dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null || true) == ii* ]]; then
+        installed=$(dpkg-query -W -f='${Version}' "$package")
+    fi
+    candidate=$(apt-cache policy "$package" | awk '/Candidate:/ { print $2; exit }')
+    [[ -n $candidate && $candidate != '(none)' ]] || die "No signed apt candidate for $package"
+    if [[ -z $installed ]]; then
+        APT_INSTALL+=("$package")
+    else
+        apt_origin_ok "$package" "$installed" || die "$package $installed is not attributable to its expected apt repository."
+        if [[ $installed != "$candidate" ]]; then APT_UPDATE+=("$package"); fi
+    fi
+done
+
+if ((${#APT_UPDATE[@]})); then
+    if ((UPDATE)); then
+        APT_INSTALL+=("${APT_UPDATE[@]}")
+    elif [[ -t 0 ]]; then
+        read -r -p "Update ${APT_UPDATE[*]} from their signed apt repositories? [y/N] " answer
+        if [[ $answer == [Yy] || $answer == [Yy][Ee][Ss] ]]; then
+            APT_INSTALL+=("${APT_UPDATE[@]}")
+        fi
+    else
+        die "Existing apt packages have updates available; rerun with --update: ${APT_UPDATE[*]}"
+    fi
+fi
+if ((${#APT_INSTALL[@]})); then
+    apt-get -y --no-install-recommends install "${APT_INSTALL[@]}"
+fi
+plannotator_profile=$'export PLANNOTATOR_BROWSER=/usr/bin/chromium\nexport PLANNOTATOR_REMOTE=0'
+if [[ -e /etc/profile.d/devcarone-host-toolchain.sh ]] && \
+    [[ $(cat /etc/profile.d/devcarone-host-toolchain.sh) != "$plannotator_profile" ]]; then
+    die 'Existing Plannotator environment profile differs from the installer policy.'
+fi
+printf '%s\n' "$plannotator_profile" > /etc/profile.d/devcarone-host-toolchain.sh
+
+mkdir -p "$STATE_DIR" "$TOOL_DIR/node" "$TOOL_DIR/npm" /opt/devcar/host-toolchain/tooling
+for secure_dir in /usr/local/bin /usr/local/lib "$STATE_DIR" "$TOOL_DIR" \
+    "$TOOL_DIR/node" "$TOOL_DIR/npm" /opt/devcar /opt/devcar/host-toolchain \
+    /opt/devcar/host-toolchain/tooling; do
+    [[ $(stat -c %u "$secure_dir") == 0 ]] || die "Install directory is not root-owned: $secure_dir"
+    permissions=$(stat -c %a "$secure_dir")
+    (( (8#$permissions & 0022) == 0 )) || die "Install directory is writable by non-root users: $secure_dir"
+done
+for state_file in "$STATE_DIR"/*; do
+    [[ -e $state_file ]] || continue
+    [[ -f $state_file && ! -L $state_file && $(stat -c %u "$state_file") == 0 ]] || \
+        die "Untrusted state file: $state_file"
+    permissions=$(stat -c %a "$state_file")
+    (( (8#$permissions & 0022) == 0 )) || die "Writable state file: $state_file"
+done
+managed_link() {
+    local link=$1 expected=$2
+    if [[ -e $link || -L $link ]]; then
+        [[ -L $link && $(readlink -- "$link") == "$expected" ]] || die "Unmanaged install at $link"
+    fi
+}
+set_link() {
+    local link=$1 target=$2 temporary
+    temporary=$link.new.$$
+    ln -s -- "$target" "$temporary"
+    mv -Tf -- "$temporary" "$link"
+}
+managed_binary() {
+    local binary=$1 marker=$2
+    if [[ -e $binary || -L $binary ]]; then
+        [[ -f $marker ]] || die "Unmanaged install at $binary"
+        [[ -f $binary && ! -L $binary ]] || die "Unexpected managed binary type at $binary"
+        printf '%s  %s\n' "$(cat "$marker")" "$binary" | sha256sum -c - >/dev/null || die "Managed binary changed: $binary"
+    fi
+}
+
+for name in node npm npx corepack; do
+    managed_link "/usr/local/bin/$name" "$TOOL_DIR/current-node/bin/$name"
+done
+managed_link "$TOOL_DIR/current-node" "${TOOL_DIR}/node/$(cat "$STATE_DIR/node-version" 2>/dev/null || true)"
+managed_link "$TOOL_DIR/current-npm" "${TOOL_DIR}/npm/$(cat "$STATE_DIR/npm-generation" 2>/dev/null || true)"
+managed_link "$TOOLING_DIR" "$(cat "$STATE_DIR/tooling-target" 2>/dev/null || true)"
+for kind in node npm; do
+    if [[ -f $STATE_DIR/$kind-bins ]]; then
+        while IFS= read -r name; do
+            [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid recorded $kind command name."
+            if [[ $kind == node ]]; then
+                managed_link "/usr/local/bin/$name" "$TOOL_DIR/current-node/bin/$name"
+            else
+                managed_link "/usr/local/bin/$name" "$TOOL_DIR/current-npm/node_modules/.bin/$name"
+            fi
+        done < "$STATE_DIR/$kind-bins"
+    fi
+done
+managed_binary /usr/local/bin/tea "$STATE_DIR/tea.sha256"
+managed_binary /usr/local/bin/gog "$STATE_DIR/gog.sha256"
+managed_binary /usr/local/bin/plannotator "$STATE_DIR/plannotator.sha256"
+
+INSTALL_MANAGED=1
+if [[ -e $STATE_DIR/node-version || -e $STATE_DIR/npm-generation || \
+      -e $STATE_DIR/tea.sha256 || -e $STATE_DIR/gog.sha256 || \
+      -e $STATE_DIR/plannotator.sha256 || -e $STATE_DIR/tooling-target ]]; then
+    if ((UPDATE)); then
+        :
+    elif [[ -t 0 ]]; then
+        read -r -p 'Update the installed Node, npm agents, tea, gogcli, Plannotator, and skills? [y/N] ' answer
+        if [[ $answer != [Yy] && $answer != [Yy][Ee][Ss] ]]; then INSTALL_MANAGED=0; fi
+    else
+        die 'Managed tools are already installed; rerun with --update in unattended mode.'
+    fi
+fi
+if ((!INSTALL_MANAGED)); then
+    for marker in node-version npm-generation tea.sha256 gog.sha256 plannotator.sha256 tooling-target; do
+        [[ -f $STATE_DIR/$marker ]] || die "Incomplete managed installation; rerun with --update ($marker missing)."
+    done
+fi
+
+if ((INSTALL_MANAGED)); then
+
+node_dir=$WORK/node-download
+mkdir "$node_dir"
+curl -fsSL --retry 3 https://nodejs.org/dist/index.json -o "$node_dir/index.json"
+node_version=$(jq -er '[.[] | select(.lts != false)] | .[0].version[1:]' "$node_dir/index.json")
+[[ $node_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Invalid latest Node LTS version $node_version"
+node_tarball=node-v${node_version}-linux-x64.tar.xz
+node_url=https://nodejs.org/dist/v${node_version}
+for file in "$node_tarball" SHASUMS256.txt SHASUMS256.txt.sig; do
+    curl -fsSL --retry 3 "$node_url/$file" -o "$node_dir/$file"
+done
+gpg --batch --quiet --import "$SCRIPT_DIR/keys/nodejs-release.asc"
+gpg --batch --status-fd 1 --verify "$node_dir/SHASUMS256.txt.sig" "$node_dir/SHASUMS256.txt" \
+    > "$node_dir/gpg-status" || die 'Node release manifest signature failed.'
+signer=$(awk '$2 == "VALIDSIG" { print $NF }' "$node_dir/gpg-status")
+case " $NODE_KEYS " in *" $signer "*) ;; *) die "Unexpected Node signer: $signer" ;; esac
+node_hash=$(awk -v file="$node_tarball" '$2 == file { print $1 }' "$node_dir/SHASUMS256.txt")
+[[ $node_hash =~ ^[a-fA-F0-9]{64}$ ]] || die 'Node tarball is absent from signed manifest.'
+printf '%s  %s\n' "$node_hash" "$node_dir/$node_tarball" | sha256sum -c - >/dev/null || die 'Node tarball hash failed.'
+node_stage=$WORK/node-stage
+mkdir "$node_stage"
+tar -xJf "$node_dir/$node_tarball" -C "$node_stage" --strip-components=1
+[[ -x $node_stage/bin/node && -f $node_stage/bin/npm ]] || die 'Node archive has unexpected contents.'
+
+NPM_PACKAGES=(
+    @openai/codex @github/copilot opencode-ai @earendil-works/pi-coding-agent
+    @anthropic-ai/claude-code firebase-tools @playwright/test
+)
+npm_stage=$WORK/npm-stage
+mkdir "$npm_stage"
+export NPM_CONFIG_USERCONFIG=/dev/null NPM_CONFIG_GLOBALCONFIG=/dev/null
+export NPM_CONFIG_CACHE=$WORK/npm-cache
+PATH=$node_stage/bin:/usr/bin:/bin "$node_stage/bin/npm" install --prefix "$npm_stage" \
+    --registry="$NPM_REGISTRY" --ignore-scripts "${NPM_PACKAGES[@]}"
+PATH=$node_stage/bin:/usr/bin:/bin "$node_stage/bin/npm" audit signatures --prefix "$npm_stage" \
+    --registry="$NPM_REGISTRY" || die 'npm registry signature or provenance audit failed.'
+for binary in "$npm_stage"/node_modules/.bin/*; do
+    [[ -e $binary || -L $binary ]] || continue
+    name=${binary##*/}
+    managed_link "/usr/local/bin/$name" "$TOOL_DIR/current-npm/node_modules/.bin/$name"
+done
+PATH=$node_stage/bin:/usr/bin:/bin "$node_stage/bin/npm" rebuild --prefix "$npm_stage" \
+    --registry="$NPM_REGISTRY" @openai/codex @github/copilot opencode-ai \
+    @anthropic-ai/claude-code firebase-tools @playwright/test
+
+for binary in "$npm_stage"/node_modules/.bin/*; do
+    [[ -e $binary || -L $binary ]] || continue
+    name=${binary##*/}
+    managed_link "/usr/local/bin/$name" "$TOOL_DIR/current-npm/node_modules/.bin/$name"
+done
+for binary in "$node_stage"/bin/*; do
+    name=${binary##*/}
+    managed_link "/usr/local/bin/$name" "$TOOL_DIR/current-node/bin/$name"
+done
+
+if [[ -e $TOOL_DIR/node/$node_version ]]; then
+    [[ -f $STATE_DIR/node-version && $(cat "$STATE_DIR/node-version") == "$node_version" ]] || die 'Unmanaged Node release directory exists.'
+else
+    mv -- "$node_stage" "$TOOL_DIR/node/$node_version"
+fi
+npm_generation=$(date -u +%Y%m%dT%H%M%SZ)-$$
+mv -- "$npm_stage" "$TOOL_DIR/npm/$npm_generation"
+set_link "$TOOL_DIR/current-node" "$TOOL_DIR/node/$node_version"
+set_link "$TOOL_DIR/current-npm" "$TOOL_DIR/npm/$npm_generation"
+for binary in "$TOOL_DIR/node/$node_version"/bin/*; do
+    set_link "/usr/local/bin/${binary##*/}" "$TOOL_DIR/current-node/bin/${binary##*/}"
+done
+for binary in "$TOOL_DIR/npm/$npm_generation"/node_modules/.bin/*; do
+    set_link "/usr/local/bin/${binary##*/}" "$TOOL_DIR/current-npm/node_modules/.bin/${binary##*/}"
+done
+for kind in node npm; do
+    if [[ $kind == node ]]; then search_dir=$TOOL_DIR/node/$node_version/bin
+    else search_dir=$TOOL_DIR/npm/$npm_generation/node_modules/.bin; fi
+    new_names=$WORK/$kind-bins
+    : > "$new_names"
+    for binary in "$search_dir"/*; do
+        [[ -e $binary || -L $binary ]] || continue
+        printf '%s\n' "${binary##*/}" >> "$new_names"
+    done
+    if [[ -f $STATE_DIR/$kind-bins ]]; then
+        while IFS= read -r old_name; do
+            if ! grep -Fxq -- "$old_name" "$new_names"; then
+                rm -- "/usr/local/bin/$old_name"
+            fi
+        done < "$STATE_DIR/$kind-bins"
+    fi
+    install -m 644 "$new_names" "$STATE_DIR/$kind-bins"
+done
+printf '%s\n' "$node_version" > "$STATE_DIR/node-version"
+printf '%s\n' "$npm_generation" > "$STATE_DIR/npm-generation"
+PATH=/usr/local/bin:/usr/bin:/bin npm cache clean --force
+
+# Metadata selects a release; cryptographic verification below decides whether
+# its bytes may be installed. Malformed or unavailable metadata uses the known
+# Dockerfile version. An invalid signature or hash always stops the run.
+latest_tag() {
+    local url=$1 destination=$2 tag
+    if ! curl -fsSL --retry 3 "$url" -o "$destination"; then return 1; fi
+    tag=$(jq -er '.tag_name' "$destination") || return 1
+    [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    printf '%s\n' "$tag"
+}
+select_tag() {
+    local name=$1 url=$2 known=$3 target=$4 tag
+    if tag=$(latest_tag "$url" "$target"); then
+        printf '%s\n' "$tag"
+    else
+        warn "Could not discover a verifiable latest $name release; using $known."
+        printf '%s\n' "$known"
+    fi
+}
+older_than() {
+    local left=$1 right=$2
+    [[ $left != "$right" && $(printf '%s\n%s\n' "$left" "$right" | sort -V | head -n 1) == "$left" ]]
+}
+
+tea_tag=$(select_tag tea https://gitea.com/api/v1/repos/gitea/tea/releases/latest "$TEA_KNOWN" "$WORK/tea-release.json")
+if [[ $tea_tag != "$TEA_KNOWN" ]] && ! jq -e --arg name "tea-${tea_tag#v}-linux-amd64" \
+    '[(.assets // [])[].name] as $names |
+        ($names | index($name) != null) and
+        ($names | index("checksums.txt") != null) and
+        ($names | index("checksums.txt.sig") != null)' "$WORK/tea-release.json" >/dev/null; then
+    warn "Latest tea release has no Linux amd64 asset; using $TEA_KNOWN."
+    tea_tag=$TEA_KNOWN
+fi
+tea_skip=0
+if [[ -f $STATE_DIR/tea.version ]] && \
+    older_than "$tea_tag" "$(cat "$STATE_DIR/tea.version")"; then
+    warn "Keeping newer verified tea $(cat "$STATE_DIR/tea.version")."
+    tea_skip=1
+fi
+if ((!tea_skip)); then
+tea_asset=tea-${tea_tag#v}-linux-amd64
+tea_url=https://gitea.com/gitea/tea/releases/download/$tea_tag
+for file in checksums.txt checksums.txt.sig "$tea_asset"; do
+    curl -fsSL --retry 3 "$tea_url/$file" -o "$WORK/$file" || die "Could not download tea $file for $tea_tag"
+done
+gpg --batch --quiet --import "$SCRIPT_DIR/keys/teabot.asc"
+gpg --batch --status-fd 1 --verify "$WORK/checksums.txt.sig" "$WORK/checksums.txt" \
+    > "$WORK/tea-gpg-status" || die 'tea checksum signature failed.'
+grep -q "^\[GNUPG:\] VALIDSIG .* ${TEA_KEY}\$" "$WORK/tea-gpg-status" || die 'Unexpected tea signer.'
+tea_hash=$(awk -v file="$tea_asset" '$2 == file { print $1 }' "$WORK/checksums.txt")
+[[ $tea_hash =~ ^[a-fA-F0-9]{64}$ ]] || die 'tea asset is absent from its signed checksum list.'
+printf '%s  %s\n' "$tea_hash" "$WORK/$tea_asset" | sha256sum -c - >/dev/null || die 'tea checksum failed.'
+install -m 755 "$WORK/$tea_asset" /usr/local/bin/tea
+sha256sum /usr/local/bin/tea | awk '{print $1}' > "$STATE_DIR/tea.sha256"
+printf '%s\n' "$tea_tag" > "$STATE_DIR/tea.version"
+fi
+
+plannotator_tag=$(select_tag plannotator https://api.github.com/repos/backnotprop/plannotator/releases/latest \
+    "$PLANNOTATOR_KNOWN" "$WORK/plannotator-release.json")
+if [[ $plannotator_tag != "$PLANNOTATOR_KNOWN" ]]; then
+    plannotator_asset=plannotator-linux-x64
+    if ! jq -e --arg name "$plannotator_asset" \
+        '[(.assets // [])[].name] | index($name) != null' "$WORK/plannotator-release.json" >/dev/null; then
+        warn "Latest Plannotator release has no Linux x64 asset; using $PLANNOTATOR_KNOWN."
+        plannotator_tag=$PLANNOTATOR_KNOWN
+    else
+        curl -fsSL --retry 3 \
+            "https://github.com/backnotprop/plannotator/releases/download/$plannotator_tag/$plannotator_asset" \
+            -o "$WORK/plannotator-probe" || die 'Could not download latest Plannotator asset.'
+        probe_hash=$(sha256sum "$WORK/plannotator-probe" | awk '{print $1}')
+        if ! curl -fsSL --retry 3 \
+            "https://api.github.com/repos/backnotprop/plannotator/attestations/sha256:$probe_hash" \
+            -o "$WORK/plannotator-probe-attestations.json" || \
+            ! jq -e '[.attestations[].bundle | select(.dsseEnvelope.payload | @base64d | fromjson
+                | .predicateType == "https://slsa.dev/provenance/v1")] | length > 0' \
+                "$WORK/plannotator-probe-attestations.json" >/dev/null; then
+            warn "Latest Plannotator release has no SLSA provenance; using $PLANNOTATOR_KNOWN."
+            plannotator_tag=$PLANNOTATOR_KNOWN
+        fi
+    fi
+fi
+plannotator_skip=0
+if [[ -f $STATE_DIR/plannotator.version ]] && \
+    older_than "$plannotator_tag" "$(cat "$STATE_DIR/plannotator.version")"; then
+    warn "Keeping newer verified Plannotator $(cat "$STATE_DIR/plannotator.version")."
+    plannotator_skip=1
+fi
+if ((!plannotator_skip)); then
+tooling_stage=$WORK/tooling-stage
+mkdir "$tooling_stage"
+matt_commit_json=$WORK/matt-commit.json
+curl -fsSL --retry 3 https://api.github.com/repos/mattpocock/skills/commits/main -o "$matt_commit_json"
+matt_commit=$(jq -er .sha "$matt_commit_json")
+[[ $matt_commit =~ ^[a-fA-F0-9]{40}$ ]] || die 'Invalid Matt Pocock commit ID.'
+bash "$SCRIPT_DIR/install-tooling.sh" "$matt_commit" "$plannotator_tag" "$tooling_stage"
+tooling_generation=$(date -u +%Y%m%dT%H%M%SZ)-$$
+tooling_target=/opt/devcar/host-toolchain/tooling/$tooling_generation
+mv -- "$tooling_stage/opt/devcar/tooling" "$tooling_target"
+install -m 755 "$tooling_stage/usr/local/bin/plannotator" /usr/local/bin/plannotator
+sha256sum /usr/local/bin/plannotator | awk '{print $1}' > "$STATE_DIR/plannotator.sha256"
+set_link "$TOOLING_DIR" "$tooling_target"
+printf '%s\n' "$tooling_target" > "$STATE_DIR/tooling-target"
+printf '%s\n' "$plannotator_tag" > "$STATE_DIR/plannotator.version"
+fi
+
+gog_tag=$(select_tag gogcli https://api.github.com/repos/openclaw/gogcli/releases/latest \
+    "$GOG_KNOWN" "$WORK/gog-release.json")
+gog_skip=0
+if [[ -f $STATE_DIR/gog.version ]] && \
+    older_than "$gog_tag" "$(cat "$STATE_DIR/gog.version")"; then
+    warn "Keeping newer verified gogcli $(cat "$STATE_DIR/gog.version")."
+    gog_skip=1
+fi
+if ((!gog_skip)); then
+mkdir "$WORK/go" "$WORK/go-cache" "$WORK/go-bin"
+proxy_token=$(od -An -N24 -tx1 /dev/urandom | tr -d '[:space:]')
+DEVCAR_GO_PROXY_TOKEN=$proxy_token python3 "$SCRIPT_DIR/go-ipv4-proxy.py" \
+    "$WORK/go-proxy-port" &
+GO_PROXY_PID=$!
+for ((attempt=0; attempt<50; attempt++)); do
+    [[ -s $WORK/go-proxy-port ]] && break
+    kill -0 "$GO_PROXY_PID" 2>/dev/null || die 'IPv4 proxy stopped before becoming ready.'
+    sleep 0.1
+done
+[[ -s $WORK/go-proxy-port ]] || die 'IPv4 proxy did not become ready.'
+proxy_port=$(cat "$WORK/go-proxy-port")
+[[ $proxy_port =~ ^[0-9]+$ ]] || die 'IPv4 proxy returned an invalid port.'
+proxy_url=http://go:$proxy_token@127.0.0.1:$proxy_port
+run_go_install() {
+    GOPATH=$WORK/go GOCACHE=$WORK/go-cache GOBIN=$WORK/go-bin \
+        GOTOOLCHAIN=auto GOSUMDB=sum.golang.org GOPROXY=https://proxy.golang.org \
+        GONOSUMDB= GOPRIVATE= GONOPROXY= GOINSECURE= GOFLAGS=-modcacherw \
+        HTTPS_PROXY=$proxy_url https_proxy=$proxy_url HTTP_PROXY= http_proxy= \
+        NO_PROXY= no_proxy= go install "github.com/openclaw/gogcli/cmd/gog@$1"
+}
+run_go_install "$gog_tag" 2> "$WORK/gog-error" || {
+        if [[ $gog_tag != "$GOG_KNOWN" ]] && grep -Eq 'unknown revision|404 Not Found' "$WORK/gog-error"; then
+            warn "Latest gogcli release has no verifiable Go module; using $GOG_KNOWN."
+            gog_tag=$GOG_KNOWN
+            if [[ -f $STATE_DIR/gog.version ]] && \
+                older_than "$gog_tag" "$(cat "$STATE_DIR/gog.version")"; then
+                warn "Keeping newer verified gogcli $(cat "$STATE_DIR/gog.version")."
+                gog_skip=1
+            else
+                if ! run_go_install "$gog_tag" 2> "$WORK/gog-known-error"; then
+                    sed "s/$proxy_token/<REDACTED>/g" "$WORK/gog-known-error" >&2
+                    die 'Known gogcli version failed Go verification or build.'
+                fi
+            fi
+        else
+            sed "s/$proxy_token/<REDACTED>/g" "$WORK/gog-error" >&2
+            die 'gogcli Go checksum database or build failed.'
+        fi
+    }
+if ((!gog_skip)); then
+install -m 755 "$WORK/go-bin/gog" /usr/local/bin/gog
+sha256sum /usr/local/bin/gog | awk '{print $1}' > "$STATE_DIR/gog.sha256"
+printf '%s\n' "$gog_tag" > "$STATE_DIR/gog.version"
+fi
+kill "$GO_PROXY_PID" 2>/dev/null || true
+wait "$GO_PROXY_PID" 2>/dev/null || true
+GO_PROXY_PID=
+fi
+fi
+
+if [[ -n $TARGET_USER ]]; then
+    user_home=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+    user_shell=$(getent passwd "$TARGET_USER" | cut -d: -f7)
+    [[ -d $user_home ]] || die "Home directory does not exist for $TARGET_USER"
+    gosu "$TARGET_USER" env HOME="$user_home" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
+        SHELL="$user_shell" CODEX_HOME="$user_home/.codex" \
+        python3 "$SCRIPT_DIR/configure-codex.py"
+    gosu "$TARGET_USER" env HOME="$user_home" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
+        SHELL="$user_shell" CLAUDE_CONFIG_DIR="$user_home/.claude" \
+        python3 "$SCRIPT_DIR/configure-claude.py"
+    DEVCAR_TOOLING=$TOOLING_DIR bash "$SCRIPT_DIR/link-skills.sh" /etc/codex/skills on
+    gosu "$TARGET_USER" env HOME="$user_home" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
+        SHELL="$user_shell" DEVCAR_TOOLING="$TOOLING_DIR" \
+        bash "$SCRIPT_DIR/link-skills.sh" "$user_home/.claude/skills" on
+else
+    echo 'System tools installed. Run again with --user NAME to configure agent hooks and skills.'
+fi
+echo 'Verified host toolchain installation complete.'
