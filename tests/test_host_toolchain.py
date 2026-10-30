@@ -61,11 +61,19 @@ class HostToolchainParityTests(unittest.TestCase):
 # (apt, downloads, signatures, builds, privilege changes) are substitutes.
 REAL_COMMANDS = """
     awk basename bash cat chmod chown cmp cp cut date dirname env find getent grep head
-    id install jq ln ls mkdir mktemp mv od python3 readlink rm sed sha256sum sleep
+    id jq ls mkdir mktemp od python3 readlink rm sed sha256sum sleep
     sort stat touch tr true uniq wc xz
 """.split()
-# Real utilities whose arguments tests inspect.
-LOGGED_REAL_COMMANDS = ("tar",)
+# Real utilities whose arguments tests inspect. If the root's fail-once file
+# holds a regular expression matching a call's arguments, that call fails once.
+LOGGED_REAL_COMMANDS = ("tar", "mv", "ln", "install")
+FAIL_ONCE = '''fail=$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/fail-once
+if [[ -f $fail && "$*" =~ $(cat "$fail") ]]; then
+    rm -f "$fail"
+    echo "injected failure: ${0##*/} $*" >&2
+    exit 1
+fi
+'''
 
 LOGGED = 'printf "%s\\n" "${0##*/} $*" >> "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/commands.log"\n'
 
@@ -216,6 +224,7 @@ class InstallerRoot:
 
     node_version = "24.0.0"
     node_archive_mode = 0o755
+    node_commands = ("node", "npm", "npx")
 
     def __init__(self, directory):
         self.root = Path(directory)
@@ -299,7 +308,7 @@ class InstallerRoot:
         for name in LOGGED_REAL_COMMANDS:
             real = shutil.which(name, path="/usr/bin:/bin")
             self.write(f"test-bin/{name}",
-                       f'#!/usr/bin/env bash\n{LOGGED}exec {real} "$@"\n', 0o755)
+                       f'#!/usr/bin/env bash\n{LOGGED}{FAIL_ONCE}exec {real} "$@"\n', 0o755)
         for name, body in SUBSTITUTES.items():
             self.write(f"test-bin/{name}", "#!/usr/bin/env bash\n" + LOGGED + body, 0o755)
 
@@ -335,7 +344,8 @@ class InstallerRoot:
                      json.dumps({"sha": "a" * 40}))
 
     def node_archive(self, owner=1001, mode=0o755):
-        files = {"bin/node": "#!/bin/sh\n", "bin/npm": FAKE_NPM, "bin/npx": "#!/bin/sh\n"}
+        files = {f"bin/{name}": FAKE_NPM if name == "npm" else "#!/bin/sh\n"
+                 for name in self.node_commands}
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w:xz") as archive:
             for name, content in files.items():
@@ -747,6 +757,113 @@ class HostInstallerReleaseTests(unittest.TestCase):
         self.assertEqual(self.recorded("plannotator"), "v9.0.0")
         self.assertEqual(self.recorded("gog"), "v9.0.0")
         self.assertEqual(self.system.tooling_tags(), ["v9.0.0"])
+
+
+class HostInstallerRecoveryTests(unittest.TestCase):
+    """An interrupted update leaves state that the next --update completes."""
+
+    # Each pattern interrupts one activation step of an update.
+    INTERRUPTIONS = {
+        "node release moved, links unchanged": r"current-node[.]devcarone-new .*current-node$",
+        "node switched, npm unchanged": r"current-npm[.]devcarone-new .*current-npm$",
+        "some command links switched": r"bin/claude[.]devcarone-new$",
+        "tea staged beside binary": r"bin/tea[.]devcarone-new$",
+        "tea replaced, hash pending": r"tea[.]sha256[.]new .*tea[.]sha256$",
+        "tooling switched, plannotator unchanged": r"bin/plannotator[.]devcarone-new .*bin/plannotator$",
+        "gogcli replaced, hash pending": r"gog[.]sha256[.]new .*gog[.]sha256$",
+    }
+
+    def install_then_offer_update(self, directory):
+        system = InstallerRoot(directory)
+        result = system.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        system.node_version = "24.1.0"
+        system.node_commands = ("node", "npm")
+        system._respond_to_known_releases()
+        system.tea_release("v9.0.0")
+        system.plannotator_release("v9.0.0")
+        system.gog_release("v9.0.0")
+        return system
+
+    def assertConsistentUpdate(self, system):
+        root = system.root
+        tools = root / "usr/local/lib/devcarone-toolchain"
+        state = root / "var/lib/devcarone-host-toolchain"
+        self.assertEqual(os.readlink(tools / "current-node"), f"{tools}/node/24.1.0")
+        self.assertTrue((root / "usr/local/bin/node").exists())
+        self.assertTrue((root / "usr/local/bin/claude").exists())
+        self.assertFalse(os.path.lexists(root / "usr/local/bin/npx"))
+        self.assertTrue((root / "opt/devcar/tooling/skills.list").exists())
+        for tool in ("tea", "plannotator", "gog"):
+            binary = root / "usr/local/bin" / tool
+            self.assertEqual((state / f"{tool}.version").read_text(), "v9.0.0\n")
+            self.assertEqual((state / f"{tool}.sha256").read_text().strip(),
+                             hashlib.sha256(binary.read_bytes()).hexdigest())
+            self.assertFalse((state / f"{tool}.sha256.new").exists())
+        self.assertEqual(sorted(path.name for path in (tools / "node").iterdir()),
+                         ["24.0.0", "24.1.0"])
+        self.assertFalse(list((root / "usr/local/bin").glob("*.devcarone-new")))
+
+    def test_update_completes_after_interruption_at_each_activation_step(self):
+        for step, pattern in self.INTERRUPTIONS.items():
+            with self.subTest(step=step), tempfile.TemporaryDirectory() as directory:
+                system = self.install_then_offer_update(directory)
+                system.write("fail-once", pattern)
+
+                interrupted = system.run("--update")
+                self.assertNotEqual(interrupted.returncode, 0)
+                self.assertIn("injected failure", interrupted.stderr)
+                self.assertFalse((system.root / "fail-once").exists())
+
+                resumed = system.run("--update")
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                self.assertConsistentUpdate(system)
+
+    def test_user_deleted_link_for_removed_command_does_not_block_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            system = self.install_then_offer_update(directory)
+            (system.root / "usr/local/bin/npx").unlink()
+
+            result = system.run("--update")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertConsistentUpdate(system)
+
+    def test_cleanup_keeps_dangling_links_it_did_not_create(self):
+        with tempfile.TemporaryDirectory() as directory:
+            system = self.install_then_offer_update(directory)
+            bin_dir = system.root / "usr/local/bin"
+            tools = system.root / "usr/local/lib/devcarone-toolchain"
+            (bin_dir / "mytool").symlink_to(system.root / "missing")
+            (bin_dir / "old-claude").symlink_to(tools / "current-npm/node_modules/.bin/gone")
+
+            result = system.run("--update")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(os.path.lexists(bin_dir / "mytool"))
+            self.assertTrue(os.path.lexists(bin_dir / "old-claude"))
+
+    def test_modified_managed_binary_still_stops_the_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            system = self.install_then_offer_update(directory)
+            (system.root / "usr/local/bin/tea").write_text("#!/bin/sh\necho changed\n")
+
+            result = system.run("--update")
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Managed binary changed", result.stderr)
+
+    def test_links_outside_installer_directories_still_stop_the_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            system = self.install_then_offer_update(directory)
+            current = system.root / "usr/local/lib/devcarone-toolchain/current-node"
+            current.unlink()
+            current.symlink_to(system.root / "tmp")
+
+            result = system.run("--update")
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Unmanaged install at", result.stderr)
 
 
 class HostInstallerBehaviorTests(unittest.TestCase):

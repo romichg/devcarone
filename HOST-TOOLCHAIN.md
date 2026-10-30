@@ -64,7 +64,8 @@ provenance for its release workflow. gogcli and its Go dependencies must pass
 Go's checksum database. The Matt Pocock skills use the commit fetched from
 GitHub's API and Git's object hashes, as in the Dockerfile. All installed
 release ownership records live under `/var/lib/devcarone-host-toolchain`;
-resolved npm versions are in the staged project's package lock.
+resolved npm versions are in the staged project's package lock. If a run is
+interrupted, run the installer again with `--update` to complete it.
 
 For Go downloads, the script starts a temporary authenticated proxy on
 `127.0.0.1` that opens IPv4 upstream sockets. Both the Go module proxy and

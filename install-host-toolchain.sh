@@ -422,51 +422,60 @@ managed_link() {
         [[ -L $link && $(readlink -- "$link") == "$expected" ]] || die "Unmanaged install at $link"
     fi
 }
-set_link() {
-    local link=$1 target=$2 temporary
-    temporary=$link.new.$$
-    ln -s -- "$target" "$temporary"
-    mv -Tf -- "$temporary" "$link"
-}
-managed_binary() {
-    local binary=$1 marker=$2
-    if [[ -e $binary || -L $binary ]]; then
-        [[ -f $marker ]] || die "Unmanaged install at $binary"
-        [[ -f $binary && ! -L $binary ]] || die "Unexpected managed binary type at $binary"
-        printf '%s  %s\n' "$(cat "$marker")" "$binary" | sha256sum -c - >/dev/null || die "Managed binary changed: $binary"
+# The tool and tooling generation directories are root-owned and used only by
+# this installer, so a link into them is the installer's even when an
+# interrupted run left it ahead of the state records.
+managed_link_within() {
+    local link=$1 directory=$2 target
+    if [[ -e $link || -L $link ]]; then
+        target=$(readlink -- "$link") || die "Unmanaged install at $link"
+        [[ $target == "$directory"/* && $target != */..* ]] || die "Unmanaged install at $link"
     fi
+}
+set_link() {
+    local link=$1 target=$2
+    ln -sfn -- "$target" "$link.devcarone-new"
+    mv -Tf -- "$link.devcarone-new" "$link"
+}
+# A managed binary matches its recorded hash, or the pending hash recorded just
+# before an interrupted replacement.
+managed_binary() {
+    local name=$1 binary=$BIN_DIR/$1 hash
+    if [[ -e $binary || -L $binary ]]; then
+        [[ -f $STATE_DIR/$name.sha256 || -f $STATE_DIR/$name.sha256.new ]] || die "Unmanaged install at $binary"
+        [[ -f $binary && ! -L $binary ]] || die "Unexpected managed binary type at $binary"
+        hash=$(sha256sum "$binary" | awk '{print $1}')
+        [[ $hash == "$(cat "$STATE_DIR/$name.sha256" 2>/dev/null)" || \
+           $hash == "$(cat "$STATE_DIR/$name.sha256.new" 2>/dev/null)" ]] || die "Managed binary changed: $binary"
+    fi
+}
+install_managed_binary() {
+    local source=$1 name=$2 version=$3 target=$BIN_DIR/$2
+    sha256sum "$source" | awk '{print $1}' > "$STATE_DIR/$name.sha256.new"
+    install -m 755 -- "$source" "$target.devcarone-new"
+    mv -f -- "$target.devcarone-new" "$target"
+    printf '%s\n' "$version" > "$STATE_DIR/$name.version"
+    mv -f -- "$STATE_DIR/$name.sha256.new" "$STATE_DIR/$name.sha256"
 }
 
 for name in node npm npx corepack; do
     managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-node/bin/$name"
 done
-managed_link "$TOOL_DIR/current-node" "${TOOL_DIR}/node/$(cat "$STATE_DIR/node-version" 2>/dev/null || true)"
-managed_link "$TOOL_DIR/current-npm" "${TOOL_DIR}/npm/$(cat "$STATE_DIR/npm-generation" 2>/dev/null || true)"
-managed_link "$TOOLING_DIR" "$(cat "$STATE_DIR/tooling-target" 2>/dev/null || true)"
-for kind in node npm; do
-    if [[ -f $STATE_DIR/$kind-bins ]]; then
-        while IFS= read -r name; do
-            [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid recorded $kind command name."
-            if [[ $kind == node ]]; then
-                managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-node/bin/$name"
-            else
-                managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-npm/node_modules/.bin/$name"
-            fi
-        done < "$STATE_DIR/$kind-bins"
-    fi
-done
-managed_binary "$BIN_DIR/tea" "$STATE_DIR/tea.sha256"
-managed_binary "$BIN_DIR/gog" "$STATE_DIR/gog.sha256"
-managed_binary "$BIN_DIR/plannotator" "$STATE_DIR/plannotator.sha256"
+managed_link_within "$TOOL_DIR/current-node" "$TOOL_DIR/node"
+managed_link_within "$TOOL_DIR/current-npm" "$TOOL_DIR/npm"
+managed_link_within "$TOOLING_DIR" "$TOOLING_GENERATIONS"
+managed_binary tea
+managed_binary gog
+managed_binary plannotator
 # Node archives record a non-root owner, which releases extracted by earlier
 # installer versions kept. Never run such a tree as root.
 untrusted_file() {
     find "$1" ! -type l \( ! -uid "$OWNER_UID" -o -perm /022 \) -print -quit
 }
-if [[ -f $STATE_DIR/node-version ]]; then
-    recorded_node=$TOOL_DIR/node/$(cat "$STATE_DIR/node-version")
-    if [[ -d $recorded_node && -n $(untrusted_file "$recorded_node") ]]; then
-        warn "Non-root accounts can modify $recorded_node; rerun with --update to replace it."
+if [[ -L $TOOL_DIR/current-node ]]; then
+    active_node=$(readlink -- "$TOOL_DIR/current-node")
+    if [[ -d $active_node && -n $(untrusted_file "$active_node") ]]; then
+        warn "Non-root accounts can modify $active_node; rerun with --update to replace it."
     fi
 fi
 
@@ -544,17 +553,18 @@ for binary in "$node_stage"/bin/*; do
     managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-node/bin/$name"
 done
 
+# Keep the active release when it is intact. Replace an existing directory
+# that other accounts could modify or that an interrupted run left inactive.
 node_release=$TOOL_DIR/node/$node_version
-if [[ -e $node_release ]]; then
-    [[ -f $STATE_DIR/node-version && $(cat "$STATE_DIR/node-version") == "$node_version" ]] || die 'Unmanaged Node release directory exists.'
-    if [[ -n $(untrusted_file "$node_release") ]]; then
-        warn "Replacing Node $node_version files that non-root accounts could modify."
-        mv -T -- "$node_release" "$node_release.untrusted.$$"
-        mv -- "$node_stage" "$node_release"
-        rm -rf -- "$node_release.untrusted.$$"
-    fi
-else
+active_node=$(readlink -- "$TOOL_DIR/current-node" 2>/dev/null || true)
+if [[ ! -e $node_release ]]; then
     mv -- "$node_stage" "$node_release"
+elif [[ $node_release != "$active_node" || -n $(untrusted_file "$node_release") ]]; then
+    [[ $node_release != "$active_node" ]] || \
+        warn "Replacing Node $node_version files that non-root accounts could modify."
+    mv -T -- "$node_release" "$node_release.replaced.$$"
+    mv -- "$node_stage" "$node_release"
+    rm -rf -- "$node_release.replaced.$$"
 fi
 npm_generation=$(date -u +%Y%m%dT%H%M%SZ)-$$
 mv -- "$npm_stage" "$TOOL_DIR/npm/$npm_generation"
@@ -566,24 +576,16 @@ done
 for binary in "$TOOL_DIR/npm/$npm_generation"/node_modules/.bin/*; do
     set_link "$BIN_DIR/${binary##*/}" "$TOOL_DIR/current-npm/node_modules/.bin/${binary##*/}"
 done
-for kind in node npm; do
-    if [[ $kind == node ]]; then search_dir=$TOOL_DIR/node/$node_version/bin
-    else search_dir=$TOOL_DIR/npm/$npm_generation/node_modules/.bin; fi
-    new_names=$WORK/$kind-bins
-    : > "$new_names"
-    for binary in "$search_dir"/*; do
-        [[ -e $binary || -L $binary ]] || continue
-        printf '%s\n' "${binary##*/}" >> "$new_names"
-    done
-    if [[ -f $STATE_DIR/$kind-bins ]]; then
-        while IFS= read -r old_name; do
-            if ! grep -Fxq -- "$old_name" "$new_names"; then
-                rm -- "$BIN_DIR/$old_name"
-            fi
-        done < "$STATE_DIR/$kind-bins"
-    fi
-    install -m 644 "$new_names" "$STATE_DIR/$kind-bins"
+# Remove the installer's command links that no active generation provides,
+# including links an interrupted run created. Name records are no longer kept.
+for link in "$BIN_DIR"/*; do
+    [[ -L $link && ! -e $link ]] || continue
+    case $(readlink -- "$link") in
+        "$TOOL_DIR/current-node/bin/${link##*/}"|"$TOOL_DIR/current-npm/node_modules/.bin/${link##*/}")
+            rm -f -- "$link" ;;
+    esac
 done
+rm -f -- "$STATE_DIR/node-bins" "$STATE_DIR/npm-bins"
 printf '%s\n' "$node_version" > "$STATE_DIR/node-version"
 printf '%s\n' "$npm_generation" > "$STATE_DIR/npm-generation"
 PATH=$BIN_DIR:$SYSTEM_PATH npm cache clean --force
@@ -659,9 +661,7 @@ grep -q "^\[GNUPG:\] VALIDSIG .* ${TEA_KEY}\$" "$WORK/tea-gpg-status" || die 'Un
 tea_hash=$(awk -v file="$tea_asset" '$2 == file { print $1 }' "$tea_dir/checksums.txt")
 [[ $tea_hash =~ ^[a-fA-F0-9]{64}$ ]] || die 'tea asset is absent from its signed checksum list.'
 printf '%s  %s\n' "$tea_hash" "$tea_dir/$tea_asset" | sha256sum -c - >/dev/null || die 'tea checksum failed.'
-install -m 755 "$tea_dir/$tea_asset" "$BIN_DIR/tea"
-sha256sum "$BIN_DIR/tea" | awk '{print $1}' > "$STATE_DIR/tea.sha256"
-printf '%s\n' "$tea_tag" > "$STATE_DIR/tea.version"
+install_managed_binary "$tea_dir/$tea_asset" tea "$tea_tag"
 fi
 
 # The tooling installer downloads and verifies the known release itself; a newer
@@ -699,11 +699,9 @@ bash "$SCRIPT_DIR/install-tooling.sh" "$matt_commit" "$plannotator_tag" "$toolin
 tooling_generation=$(date -u +%Y%m%dT%H%M%SZ)-$$
 tooling_target=$TOOLING_GENERATIONS/$tooling_generation
 mv -- "$tooling_stage/opt/devcar/tooling" "$tooling_target"
-install -m 755 "$tooling_stage/usr/local/bin/plannotator" "$BIN_DIR/plannotator"
-sha256sum "$BIN_DIR/plannotator" | awk '{print $1}' > "$STATE_DIR/plannotator.sha256"
 set_link "$TOOLING_DIR" "$tooling_target"
 printf '%s\n' "$tooling_target" > "$STATE_DIR/tooling-target"
-printf '%s\n' "$plannotator_tag" > "$STATE_DIR/plannotator.version"
+install_managed_binary "$tooling_stage/usr/local/bin/plannotator" plannotator "$plannotator_tag"
 fi
 
 gog_tag=$(select_tag gogcli https://api.github.com/repos/openclaw/gogcli/releases/latest \
@@ -737,9 +735,7 @@ fetch_gog() {
 }
 gog_tag=$(fetch_release gog "$gog_tag" "$GOG_KNOWN" fetch_gog)
 if [[ -n $gog_tag ]]; then
-install -m 755 "$WORK/go-bin/gog" "$BIN_DIR/gog"
-sha256sum "$BIN_DIR/gog" | awk '{print $1}' > "$STATE_DIR/gog.sha256"
-printf '%s\n' "$gog_tag" > "$STATE_DIR/gog.version"
+install_managed_binary "$WORK/go-bin/gog" gog "$gog_tag"
 fi
 kill "$GO_PROXY_PID" 2>/dev/null || true
 wait "$GO_PROXY_PID" 2>/dev/null || true
