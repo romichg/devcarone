@@ -229,6 +229,101 @@ enable_debian_components() {
         END { flush() }' "$1"
 }
 
+# Treat end of input or anything but yes as refusal.
+confirm() {
+    local answer
+    if ! read -r -p "$1 [y/N] " answer; then
+        echo >&2
+        warn 'No answer; treating it as no.'
+        return 1
+    fi
+    [[ $answer == [Yy] || $answer == [Yy][Ee][Ss] ]]
+}
+
+installed_version() {
+    if [[ $(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null || true) == ii* ]]; then
+        dpkg-query -W -f='${Version}' "$1"
+    fi
+}
+
+# A matching name is not enough: the installed version must exist in the
+# expected signed apt repository. Debian packages may already be in a base OS.
+apt_origin_ok() {
+    local package=$1 version=$2 code=0
+    [[ $package != code ]] || code=1
+    apt-cache policy "$package" | awk -v version="$version" -v code="$code" \
+        -v archive_uri="$DEBIAN_ARCHIVE_URI" -v archive_suites="$DEBIAN_ARCHIVE_SUITES" \
+        -v security_uri="$DEBIAN_SECURITY_URI" -v security_suites="$DEBIAN_SECURITY_SUITES" '
+        $1 == "***" && $2 == version { in_version = 1; next }
+        $1 == version { in_version = 1; next }
+        in_version && /^     [^ ]/ { in_version = 0 }
+        in_version {
+            suite = $3
+            sub(/\/.*/, "", suite)
+            if (code) {
+                if ($2 ~ /^https:\/\/packages[.]microsoft[.]com\/repos\/code\/?$/ && suite == "stable") found = 1
+            } else if (($2 ~ archive_uri && suite ~ archive_suites) ||
+                       ($2 ~ security_uri && suite ~ security_suites)) {
+                found = 1
+            }
+        }
+        END { exit !found }
+    '
+}
+
+# Set APT_REQUEST to the packages that are missing or have a newer candidate.
+# Requesting only those leaves up-to-date packages' manual/automatic marks alone.
+select_apt_packages() {
+    local package installed candidate
+    APT_REQUEST=()
+    for package; do
+        installed=$(installed_version "$package")
+        candidate=$(apt-cache policy "$package" | awk '/Candidate:/ { print $2; exit }')
+        [[ -n $candidate && $candidate != '(none)' ]] || die "No signed apt candidate for $package"
+        if [[ -z $installed ]]; then
+            APT_REQUEST+=("$package")
+        else
+            apt_origin_ok "$package" "$installed" || die "$package $installed is not attributable to its expected apt repository."
+            [[ $installed == "$candidate" ]] || APT_REQUEST+=("$package")
+        fi
+    done
+}
+
+# Print the installed packages that apt would upgrade or remove while
+# installing the arguments, as "upgrade NAME" or "remove NAME".
+apt_changes() {
+    apt-get -s --no-install-recommends install "$@" | awk '
+        $1 == "Inst" && $3 ~ /^\[/ { print "upgrade", $2 }
+        $1 == "Remv" { print "remove", $2 }'
+}
+
+# Install packages without changing an installed package unless --update or
+# the user allows it. Dependency upgrades need the same consent, and a refusal
+# holds for the rest of the run.
+APT_UPDATES_DECLINED=0
+apt_install() {
+    (($#)) || return 0
+    local changes removals upgrades package new=()
+    changes=$(apt_changes "$@")
+    removals=$(awk '$1 == "remove" { printf " %s", $2 }' <<< "$changes")
+    [[ -z $removals ]] || die "Installing $* would remove$removals; resolve that before installation."
+    upgrades=$(awk '$1 == "upgrade" { printf " %s", $2 }' <<< "$changes")
+    if [[ -n $upgrades ]] && ((!UPDATE)); then
+        [[ -t 0 ]] || die "Existing apt packages have updates available; rerun with --update:$upgrades"
+        if ((APT_UPDATES_DECLINED)) || ! confirm "Update$upgrades from their signed apt repositories?"; then
+            APT_UPDATES_DECLINED=1
+            for package; do
+                [[ -n $(installed_version "$package") ]] || new+=("$package")
+            done
+            ((${#new[@]})) || return 0
+            changes=$(apt_changes "${new[@]}")
+            [[ -z $changes ]] || die "Installing ${new[*]} requires updating$(awk '{ printf " %s", $2 }' <<< "$changes"); rerun with --update."
+            set -- "${new[@]}"
+        fi
+    fi
+    apt-get -y --no-install-recommends install "$@"
+}
+
 unset APT_CONFIG
 [[ -f $DEBIAN_SOURCES ]] || die "Missing standard Debian source file $DEBIAN_SOURCES"
 if [[ -s $APT_DIR/sources.list ]]; then
@@ -270,7 +365,8 @@ else
     mv -f -- "$DEBIAN_SOURCES.devcarone.$$" "$DEBIAN_SOURCES"
 fi
 apt-get update
-apt-get -y --no-install-recommends install ca-certificates curl gnupg jq xz-utils
+select_apt_packages ca-certificates curl gnupg jq xz-utils
+apt_install "${APT_REQUEST[@]}"
 for keyring in $debian_keyrings; do
     verify_key_file "$ROOT$keyring" "$DEBIAN_KEYS"
 done
@@ -295,63 +391,9 @@ APT_PACKAGES=(
     python3 python3-pip python3-venv python3-pytest python3-yaml python3-tomlkit cosign code
 )
 
-# A matching name is not enough: the installed version must exist in the
-# expected signed apt repository. Debian packages may already be in a base OS.
-apt_origin_ok() {
-    local package=$1 version=$2 code=0
-    [[ $package != code ]] || code=1
-    apt-cache policy "$package" | awk -v version="$version" -v code="$code" \
-        -v archive_uri="$DEBIAN_ARCHIVE_URI" -v archive_suites="$DEBIAN_ARCHIVE_SUITES" \
-        -v security_uri="$DEBIAN_SECURITY_URI" -v security_suites="$DEBIAN_SECURITY_SUITES" '
-        $1 == "***" && $2 == version { in_version = 1; next }
-        $1 == version { in_version = 1; next }
-        in_version && /^     [^ ]/ { in_version = 0 }
-        in_version {
-            suite = $3
-            sub(/\/.*/, "", suite)
-            if (code) {
-                if ($2 ~ /^https:\/\/packages[.]microsoft[.]com\/repos\/code\/?$/ && suite == "stable") found = 1
-            } else if (($2 ~ archive_uri && suite ~ archive_suites) ||
-                       ($2 ~ security_uri && suite ~ security_suites)) {
-                found = 1
-            }
-        }
-        END { exit !found }
-    '
-}
 
-APT_INSTALL=()
-APT_UPDATE=()
-for package in "${APT_PACKAGES[@]}"; do
-    installed=
-    if [[ $(dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null || true) == ii* ]]; then
-        installed=$(dpkg-query -W -f='${Version}' "$package")
-    fi
-    candidate=$(apt-cache policy "$package" | awk '/Candidate:/ { print $2; exit }')
-    [[ -n $candidate && $candidate != '(none)' ]] || die "No signed apt candidate for $package"
-    if [[ -z $installed ]]; then
-        APT_INSTALL+=("$package")
-    else
-        apt_origin_ok "$package" "$installed" || die "$package $installed is not attributable to its expected apt repository."
-        if [[ $installed != "$candidate" ]]; then APT_UPDATE+=("$package"); fi
-    fi
-done
-
-if ((${#APT_UPDATE[@]})); then
-    if ((UPDATE)); then
-        APT_INSTALL+=("${APT_UPDATE[@]}")
-    elif [[ -t 0 ]]; then
-        read -r -p "Update ${APT_UPDATE[*]} from their signed apt repositories? [y/N] " answer
-        if [[ $answer == [Yy] || $answer == [Yy][Ee][Ss] ]]; then
-            APT_INSTALL+=("${APT_UPDATE[@]}")
-        fi
-    else
-        die "Existing apt packages have updates available; rerun with --update: ${APT_UPDATE[*]}"
-    fi
-fi
-if ((${#APT_INSTALL[@]})); then
-    apt-get -y --no-install-recommends install "${APT_INSTALL[@]}"
-fi
+select_apt_packages "${APT_PACKAGES[@]}"
+apt_install "${APT_REQUEST[@]}"
 plannotator_profile=$'export PLANNOTATOR_BROWSER=/usr/bin/chromium\nexport PLANNOTATOR_REMOTE=0'
 if [[ -e "$PROFILE_FILE" ]] && \
     [[ $(cat "$PROFILE_FILE") != "$plannotator_profile" ]]; then
@@ -435,8 +477,7 @@ if [[ -e $STATE_DIR/node-version || -e $STATE_DIR/npm-generation || \
     if ((UPDATE)); then
         :
     elif [[ -t 0 ]]; then
-        read -r -p 'Update the installed Node, npm agents, tea, gogcli, Plannotator, and skills? [y/N] ' answer
-        if [[ $answer != [Yy] && $answer != [Yy][Ee][Ss] ]]; then INSTALL_MANAGED=0; fi
+        confirm 'Update the installed Node, npm agents, tea, gogcli, Plannotator, and skills?' || INSTALL_MANAGED=0
     else
         die 'Managed tools are already installed; rerun with --update in unattended mode.'
     fi

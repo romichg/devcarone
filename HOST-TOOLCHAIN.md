@@ -13,8 +13,10 @@ sudo ./install-host-toolchain.sh --update
 ```
 
 The first form prompts before updating existing packages installed by the
-same trusted source. It stops on a noninteractive input stream if an update
-needs a decision. `--update` updates the managed toolchain without prompting;
+same trusted source, including the bootstrap tools and any dependency apt
+would upgrade; declining keeps their versions and still installs new packages
+that need no upgrade. It stops on a noninteractive input stream if an update
+needs a decision, and it never lets apt remove a package. `--update` updates the managed toolchain without prompting;
 use it in a Docker build. The installer configures Codex and Claude Code
 Plannotator hooks and shared skill links for the account that invoked `sudo`.
 For an image build or a root session, supply `--user NAME` after creating that

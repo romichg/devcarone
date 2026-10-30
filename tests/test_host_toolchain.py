@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import pty
 from pathlib import Path
 import re
 import shutil
@@ -69,7 +70,41 @@ LOGGED = 'printf "%s\\n" "${0##*/} $*" >> "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/comm
 
 SUBSTITUTES = {
     "dpkg": 'echo amd64\n',
-    "apt-get": "",
+    # Installs or simulates (-s) the requested packages with candidate versions.
+    # apt/depends/<package> lists dependencies; apt/removes/<package> lists
+    # packages that installing it would remove.
+    "apt-get": '''
+root=$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/apt
+simulate=0 packages=() seen_install=0
+for argument; do
+    case $argument in
+        -s) simulate=1 ;;
+        install) seen_install=1 ;;
+        -*) ;;
+        *) ((seen_install)) && packages+=("$argument") ;;
+    esac
+done
+((seen_install)) || exit 0
+for package in "${packages[@]}"; do
+    for name in $package $(cat "$root/depends/$package" 2>/dev/null); do
+        candidate=$(cat "$root/candidate/$name" 2>/dev/null || echo 1.0)
+        installed=$(cat "$root/installed/$name" 2>/dev/null || true)
+        [[ $installed == "$candidate" ]] && continue
+        if ((simulate)); then
+            if [[ -n $installed ]]; then
+                echo "Inst $name [$installed] ($candidate Debian:13 [amd64])"
+            else
+                echo "Inst $name ($candidate Debian:13 [amd64])"
+            fi
+        else
+            echo "$candidate" > "$root/installed/$name"
+        fi
+    done
+    for name in $(cat "$root/removes/$package" 2>/dev/null); do
+        if ((simulate)); then echo "Remv $name [1.0]"; else rm -f "$root/installed/$name"; fi
+    done
+done
+''',
     # Defaults from apt-config dump plus any settings in apt/config.
     "apt-config": '''
 printf '%s\\n' 'Dir "/";' 'Dir::Etc "etc/apt/";' 'Dir::Etc::sourcelist "sources.list";' \\
@@ -252,17 +287,37 @@ class InstallerRoot:
                 archive.addfile(info, io.BytesIO(data))
         return buffer.getvalue()
 
-    def run(self, *arguments, input=""):
+    def run(self, *arguments, input="", terminal=None):
         environment = {
             "PATH": str(self.root / "test-bin"),
             "HOME": str(self.root / "home"),
             "TMPDIR": str(self.root / "tmp"),
             "DEVCAR_HOST_TOOLCHAIN_TEST_ROOT": str(self.root),
         }
-        return subprocess.run(
-            [str(self.root / "test-bin/bash"), str(self.bundle / "install-host-toolchain.sh"),
-             *arguments],
-            env=environment, input=input, capture_output=True, text=True, timeout=60)
+        command = [str(self.root / "test-bin/bash"),
+                   str(self.bundle / "install-host-toolchain.sh"), *arguments]
+        if terminal is None:
+            return subprocess.run(command, env=environment, input=input,
+                                  capture_output=True, text=True, timeout=60)
+        # Answer prompts through a pseudo-terminal; "\x04" ends input.
+        controller, terminal_fd = pty.openpty()
+        try:
+            os.write(controller, terminal.encode())
+            return subprocess.run(command, env=environment, stdin=terminal_fd,
+                                  capture_output=True, text=True, timeout=60)
+        finally:
+            os.close(controller)
+            os.close(terminal_fd)
+
+    def installed(self, package, version=None):
+        path = self.root / "apt/installed" / package
+        if version is not None:
+            self.write(f"apt/installed/{package}", version + "\n")
+        return path.read_text().strip() if path.exists() else None
+
+    def apt_installs(self):
+        return [line.split(" install ", 1)[1].split()
+                for line in self.commands() if line.startswith("apt-get -y ")]
 
     def commands(self):
         log = self.root / "commands.log"
@@ -395,6 +450,102 @@ class HostInstallerSourceTests(unittest.TestCase):
         self.assertIn(" intel-media-va-driver-non-free ", next(
             line for line in self.system.commands()
             if line.startswith("apt-get -y --no-install-recommends install sudo")))
+
+
+class HostInstallerAptConsentTests(unittest.TestCase):
+    """Existing apt packages change only with --update or the user's consent."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.system = InstallerRoot(directory.name)
+
+    def outdated_bootstrap_package(self):
+        self.system.installed("curl", "0.9")
+
+    def test_up_to_date_bootstrap_package_is_not_requested(self):
+        self.system.installed("curl", "1.0")
+
+        result = self.system.run()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.system.apt_installs()[0], ["ca-certificates", "gnupg", "jq", "xz-utils"])
+        self.assertTrue(all("curl" not in install for install in self.system.apt_installs()))
+
+    def test_unattended_run_stops_before_upgrading_bootstrap_package(self):
+        self.outdated_bootstrap_package()
+
+        result = self.system.run()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("rerun with --update: curl", result.stderr)
+        self.assertEqual(self.system.apt_installs(), [])
+        self.assertEqual(self.system.installed("curl"), "0.9")
+
+    def test_update_option_upgrades_existing_packages(self):
+        self.outdated_bootstrap_package()
+
+        result = self.system.run("--update")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("curl", self.system.apt_installs()[0])
+        self.assertEqual(self.system.installed("curl"), "1.0")
+
+    def test_declining_keeps_existing_versions_and_installs_new_packages(self):
+        self.outdated_bootstrap_package()
+
+        result = self.system.run(terminal="n\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("Update curl from their signed apt repositories?"), 1)
+        self.assertEqual(self.system.installed("curl"), "0.9")
+        self.assertEqual(self.system.apt_installs()[0], ["ca-certificates", "gnupg", "jq", "xz-utils"])
+        self.assertIn("sudo", self.system.apt_installs()[1])
+        self.assertNotIn("curl", self.system.apt_installs()[1])
+
+    def test_accepting_upgrades_existing_packages(self):
+        self.outdated_bootstrap_package()
+
+        result = self.system.run(terminal="y\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.system.installed("curl"), "1.0")
+
+    def test_end_of_input_at_prompt_is_a_refusal(self):
+        self.outdated_bootstrap_package()
+
+        result = self.system.run(terminal="\x04")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("No answer; treating it as no.", result.stderr)
+        self.assertEqual(self.system.installed("curl"), "0.9")
+
+    def test_dependency_upgrade_of_new_package_needs_consent(self):
+        self.system.write("apt/depends/vim", "libvim-runtime\n")
+        self.system.installed("libvim-runtime", "0.9")
+
+        unattended = self.system.run()
+        self.assertEqual(unattended.returncode, 1)
+        self.assertIn("rerun with --update: libvim-runtime", unattended.stderr)
+
+        declined = self.system.run(terminal="n\n")
+        self.assertEqual(declined.returncode, 1)
+        self.assertIn("requires updating libvim-runtime; rerun with --update", declined.stderr)
+        self.assertEqual(self.system.installed("libvim-runtime"), "0.9")
+
+        updated = self.system.run("--update")
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertEqual(self.system.installed("libvim-runtime"), "1.0")
+
+    def test_installation_that_would_remove_a_package_is_refused(self):
+        self.system.write("apt/removes/vim", "vim-tiny\n")
+        self.system.installed("vim-tiny", "1.0")
+
+        result = self.system.run("--update")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("would remove vim-tiny", result.stderr)
+        self.assertEqual(self.system.installed("vim-tiny"), "1.0")
 
 
 class HostInstallerBehaviorTests(unittest.TestCase):
