@@ -58,7 +58,7 @@ class HostToolchainParityTests(unittest.TestCase):
 # Real utilities the installer may run inside the test root. External effects
 # (apt, downloads, signatures, builds, privilege changes) are substitutes.
 REAL_COMMANDS = """
-    awk basename bash cat chmod cmp cp cut date dirname env find getent grep head
+    awk basename bash cat chmod chown cmp cp cut date dirname env find getent grep head
     id install jq ln ls mkdir mktemp mv od python3 readlink rm sed sha256sum sleep
     sort stat touch tr true uniq wc xz
 """.split()
@@ -70,24 +70,37 @@ LOGGED = 'printf "%s\\n" "${0##*/} $*" >> "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/comm
 SUBSTITUTES = {
     "dpkg": 'echo amd64\n',
     "apt-get": "",
-    # Installed versions live in apt/installed/<package>; candidates default to 1.0.
+    # Defaults from apt-config dump plus any settings in apt/config.
+    "apt-config": '''
+printf '%s\\n' 'Dir "/";' 'Dir::Etc "etc/apt/";' 'Dir::Etc::sourcelist "sources.list";' \\
+    'Dir::Etc::sourceparts "sources.list.d";' 'APT::Get::AllowUnauthenticated "false";'
+cat "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/apt/config" 2>/dev/null || true
+''',
+    # Installed versions live in apt/installed/<package>.
     "dpkg-query": '''
 state=$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/apt/installed/${@: -1}
 [[ -f $state ]] || exit 1
 case $* in *Status*) echo 'ii ' ;; *) cat "$state" ;; esac
 ''',
+    # Candidates default to 1.0 from suite apt/suite/<package> (default trixie).
+    # Like apt, the non-free driver has no candidate until non-free is enabled.
     "apt-cache": '''
 package=$2 root=$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/apt
 candidate=$(cat "$root/candidate/$package" 2>/dev/null || echo 1.0)
 installed=$(cat "$root/installed/$package" 2>/dev/null || echo '(none)')
+suite=$(cat "$root/suite/$package" 2>/dev/null || echo trixie)
 origin=https://deb.debian.org/debian
-[[ $package == code ]] && origin=https://packages.microsoft.com/repos/code
+if [[ $package == code ]]; then origin=https://packages.microsoft.com/repos/code suite=stable; fi
+if [[ $package == intel-media-va-driver-non-free ]] && ! grep -Eq \\
+    '^Components:.* non-free( |$)' "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/etc/apt/sources.list.d/debian.sources"; then
+    candidate='(none)'
+fi
 printf '%s:\\n  Installed: %s\\n  Candidate: %s\\n  Version table:\\n' \\
     "$package" "$installed" "$candidate"
 for version in $(printf '%s\\n%s\\n' "$candidate" "$installed" | grep -v none | sort -u); do
     marker='    '
     [[ $version == "$installed" ]] && marker=' ***'
-    printf '%s %s 500\\n        500 %s trixie/main amd64 Packages\\n' "$marker" "$version" "$origin"
+    printf '%s %s 500\\n        500 %s %s/main amd64 Packages\\n' "$marker" "$version" "$origin" "$suite"
 done
 ''',
     # Key files hold their fingerprints, one per line; signatures hold the signer.
@@ -254,6 +267,134 @@ class InstallerRoot:
     def commands(self):
         log = self.root / "commands.log"
         return log.read_text().splitlines() if log.exists() else []
+
+
+ARCHIVE_STANZA = """Types: deb
+URIs: https://deb.debian.org/debian
+Suites: trixie trixie-updates
+Components: {components}
+Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
+"""
+
+
+class HostInstallerSourceTests(unittest.TestCase):
+    """Apt configuration is validated completely before apt runs or anything changes."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.system = InstallerRoot(directory.name)
+        self.sources = self.system.root / "etc/apt/sources.list.d/debian.sources"
+
+    def use_sources(self, text):
+        self.sources.write_text(text)
+
+    def assertRefused(self, message):
+        before = self.sources.read_text()
+        result = self.system.run()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(message, result.stderr)
+        self.assertFalse([line for line in self.system.commands() if line.startswith("apt-get")])
+        self.assertEqual(self.sources.read_text(), before)
+        self.assertFalse((self.system.root / "etc/apt/preferences.d/devcarone-host-toolchain").exists())
+
+    def test_additional_uri_in_an_allowed_stanza_is_refused(self):
+        self.use_sources(DEBIAN_SOURCES.replace(
+            "URIs: https://deb.debian.org/debian",
+            "URIs: https://deb.debian.org/debian https://packages.example.com/debian", 1))
+        self.assertRefused("unexpected repository URI https://packages.example.com/debian")
+
+    def test_additional_stanza_with_another_repository_is_refused(self):
+        self.use_sources(DEBIAN_SOURCES + "\n" + ARCHIVE_STANZA.format(components="main").replace(
+            "https://deb.debian.org/debian", "https://mirror.example.com/debian"))
+        self.assertRefused("unexpected repository URI https://mirror.example.com/debian")
+
+    def test_trust_and_authentication_options_are_refused(self):
+        for option in ("Trusted: yes", "Allow-Insecure: yes", "Allow-Weak: yes"):
+            with self.subTest(option=option):
+                self.use_sources(DEBIAN_SOURCES.replace(
+                    "Components: main\n", f"Components: main\n{option}\n", 1))
+                self.assertRefused("unsupported option " + option.split(":")[0].lower())
+
+    def test_stanza_without_debian_keyring_scope_is_refused(self):
+        for replacement in ("", "Signed-By: /etc/apt/trusted.gpg.d/other.gpg\n",
+                            "Signed-By:\n -----BEGIN PGP PUBLIC KEY BLOCK-----\n"):
+            with self.subTest(replacement=replacement):
+                self.use_sources(DEBIAN_SOURCES.replace(
+                    "Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp\n", replacement, 1))
+                self.assertRefused("Signed-By must name the Debian archive keyring")
+
+    def test_unsupported_suites_are_refused(self):
+        for old, new in (("Suites: trixie trixie-updates", "Suites: trixie sid"),
+                         ("Suites: trixie trixie-updates", "Suites: trixie-security"),
+                         ("Suites: trixie-security", "Suites: trixie")):
+            with self.subTest(suites=new):
+                self.use_sources(DEBIAN_SOURCES.replace(old, new, 1))
+                self.assertRefused("unexpected suite")
+
+    def test_apt_settings_that_weaken_authentication_are_refused(self):
+        for setting in ('Acquire::AllowInsecureRepositories "true";',
+                        'Binary::apt-get::APT::Get::AllowUnauthenticated "1";',
+                        'Acquire::AllowDowngradeToInsecureRepositories "yes";',
+                        'Dir::Etc::sourceparts "/srv/apt/sources.d";'):
+            with self.subTest(setting=setting):
+                self.system.write("apt/config", setting + "\n")
+                self.assertRefused(f"Apt setting {setting.split()[0]} needs review")
+
+    def test_disabled_stanza_and_supported_suites_are_accepted(self):
+        disabled = ARCHIVE_STANZA.format(components="main").replace(
+            "https://deb.debian.org/debian", "https://mirror.example.com/debian") + "Enabled: no\n"
+        self.use_sources(DEBIAN_SOURCES.replace(
+            "Types: deb\n", "# Debian archive\nTypes: deb deb-src\n", 1).replace(
+            "trixie trixie-updates", "trixie trixie-updates trixie-backports", 1) + "\n" + disabled)
+
+        result = self.system.run()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = self.sources.read_text()
+        self.assertIn("# Debian archive\nTypes: deb deb-src\n", text)
+        self.assertIn("Components: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n"
+                      "Enabled: no\n", text)
+
+    def test_installed_package_from_unsupported_suite_is_refused(self):
+        self.system.write("apt/installed/vim", "1.0\n")
+        self.system.write("apt/suite/vim", "sid\n")
+
+        result = self.system.run()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("vim 1.0 is not attributable to its expected apt repository", result.stderr)
+
+    def test_required_components_are_added_to_each_active_stanza_once(self):
+        cases = {
+            "main": "main contrib non-free non-free-firmware",
+            "main non-free-firmware": "main non-free-firmware contrib non-free",
+            "main contrib": "main contrib non-free non-free-firmware",
+            "main contrib non-free non-free-firmware": "main contrib non-free non-free-firmware",
+            "non-free-firmware main contrib non-free": "non-free-firmware main contrib non-free",
+        }
+        for existing, expected in cases.items():
+            with self.subTest(existing=existing):
+                self.use_sources(DEBIAN_SOURCES.replace("Components: main", f"Components: {existing}"))
+                before = self.sources.stat()
+                self.sources.chmod(0o640)
+
+                result = self.system.run("--update")
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.sources.read_text(), DEBIAN_SOURCES.replace(
+                    "Components: main", f"Components: {expected}"))
+                self.assertEqual(self.sources.stat().st_mode & 0o777, 0o640)
+                if existing == expected:
+                    self.assertEqual(self.sources.stat().st_ino, before.st_ino)
+
+    def test_enabling_non_free_makes_the_driver_candidate_available(self):
+        result = self.system.run()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(" intel-media-va-driver-non-free ", next(
+            line for line in self.system.commands()
+            if line.startswith("apt-get -y --no-install-recommends install sudo")))
 
 
 class HostInstallerBehaviorTests(unittest.TestCase):

@@ -33,16 +33,23 @@ Plannotator with Debian Chromium. In another Docker image, also set
 `ENV PLANNOTATOR_BROWSER=/usr/bin/chromium PLANNOTATOR_REMOTE=0` for programs
 started without a login shell.
 
-The script requires the standard Debian `debian.sources` file signed by the
-Debian archive keyring, and refuses additional apt sources. It enables Debian's
-`contrib`, `non-free`, and `non-free-firmware` components for the Intel media
-driver, then adds the VS Code repository with the committed Microsoft key.
+The script requires the standard Debian `debian.sources` file and refuses
+additional apt sources; `apt modernize-sources` converts a one-line
+`sources.list`. Every active stanza must use `deb.debian.org` (trixie,
+trixie-updates, or trixie-backports) or `security.debian.org`
+(trixie-security), name the Debian archive keyring in `Signed-By`, and use no
+other options such as `Trusted`. Apt settings that allow insecure or
+unauthenticated repositories, or that move the source lists, stop the run.
+These checks finish before apt runs or any apt file changes. The script then
+adds any missing `contrib`, `non-free`, and `non-free-firmware` components for
+the Intel media driver, keeping existing components, and adds the VS Code
+repository with the committed Microsoft key.
 An installed apt package is recognized only if its version is available from
-the expected signed Debian or Microsoft repository. Debian's package database
-does not retain the repository that originally supplied an installed package,
-so a matching version cannot prove its history. Existing Node, npm agent, tea,
-gogcli, or Plannotator commands
-without this installer's ownership record cause the run to stop.
+one of those Debian suites or the signed Microsoft repository. Debian's
+package database does not retain the repository that originally supplied an
+installed package, so a matching version cannot prove its history. Existing
+Node, npm agent, tea, gogcli, or Plannotator commands without this installer's
+ownership record cause the run to stop.
 
 Node's archive is checked against a GPG signed release manifest and the
 allowed Node signer fingerprints in the script. It is extracted with root

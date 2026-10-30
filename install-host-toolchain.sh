@@ -125,28 +125,130 @@ readonly NODE_KEYS='5BE8A3F6C8A5C01D106C0AD820B1A390B168D356 DD792F5973C6DE52C43
 readonly MICROSOFT_KEY=BC528686B50D79E339D3721CEB3E94ADBE1229CF
 readonly TEA_KEY=7C9E68152594688862D62AF62D9AE806EC1592E2
 
-# Apt authenticates the bootstrap packages before gpg/jq are available. On a
-# standard Trixie machine, debian.sources scopes apt to the Debian archive key.
-debian_signed_by=$(awk -F': ' '$1 == "Signed-By" { print $2 }' \
-    $APT_DIR/sources.list.d/debian.sources | sort -u)
-case $debian_signed_by in
-    /usr/share/keyrings/debian-archive-keyring.pgp|/usr/share/keyrings/debian-archive-keyring.gpg) ;;
-    *) die 'Expected Debian Signed-By archive keyring is missing.' ;;
-esac
-[[ -f $ROOT$debian_signed_by ]] || die "Missing Debian archive keyring $debian_signed_by"
+# Apt authenticates the bootstrap packages before gpg/jq are available, so the
+# whole apt configuration is checked before any of it changes or apt runs.
+readonly DEBIAN_SOURCES=$APT_DIR/sources.list.d/debian.sources
+readonly VSCODE_SOURCES=$APT_DIR/sources.list.d/vscode.list
+# Bracket expressions keep these patterns intact when passed through awk -v.
+readonly DEBIAN_ARCHIVE_URI='^https?://deb[.]debian[.]org/debian/?$'
+readonly DEBIAN_ARCHIVE_SUITES='^trixie(-updates|-backports)?$'
+readonly DEBIAN_SECURITY_URI='^https?://security[.]debian[.]org/debian-security/?$'
+readonly DEBIAN_SECURITY_SUITES='^trixie-security$'
+readonly DEBIAN_KEYRING_PATHS='^/usr/share/keyrings/debian-archive-keyring[.](pgp|gpg)$'
+readonly DEBIAN_COMPONENTS='main contrib non-free non-free-firmware'
+
+# Print each active stanza's keyring, or the first problem and fail. Only plain
+# fields are accepted, so options such as Trusted or Allow-Insecure are refused.
+debian_source_keyrings() {
+    awk -v archive_uri="$DEBIAN_ARCHIVE_URI" -v archive_suites="$DEBIAN_ARCHIVE_SUITES" \
+        -v security_uri="$DEBIAN_SECURITY_URI" -v security_suites="$DEBIAN_SECURITY_SUITES" \
+        -v keyring_paths="$DEBIAN_KEYRING_PATHS" '
+        function fail(message) { print message; failed = 1; exit 1 }
+        function check(   key, i, j, uri_count, suite_count, uris, suites, types, suite_pattern) {
+            if (!fields) return
+            fields = 0
+            if (tolower(field["enabled"]) == "no") { split("", field); return }
+            for (key in field)
+                if (index(" types uris suites components signed-by enabled architectures ", " " key " ") == 0)
+                    fail("unsupported option " key)
+            if (field["enabled"] != "" && tolower(field["enabled"]) != "yes") fail("unsupported Enabled value")
+            if (!split(field["types"], types, " ")) fail("missing Types")
+            for (i in types) if (types[i] != "deb" && types[i] != "deb-src") fail("unsupported type " types[i])
+            if (field["signed-by"] !~ keyring_paths) fail("Signed-By must name the Debian archive keyring")
+            if (field["components"] == "") fail("missing Components")
+            uri_count = split(field["uris"], uris, " ")
+            suite_count = split(field["suites"], suites, " ")
+            if (!uri_count || !suite_count) fail("missing URIs or Suites")
+            for (i = 1; i <= uri_count; i++) {
+                if (uris[i] ~ archive_uri) suite_pattern = archive_suites
+                else if (uris[i] ~ security_uri) suite_pattern = security_suites
+                else fail("unexpected repository URI " uris[i])
+                for (j = 1; j <= suite_count; j++)
+                    if (suites[j] !~ suite_pattern) fail("unexpected suite " suites[j] " for " uris[i])
+            }
+            if (!(field["signed-by"] in keyrings)) { keyrings[field["signed-by"]] = 1; count++ }
+            split("", field)
+        }
+        /^#/ { next }
+        /^[ \t]*$/ { check(); next }
+        /^[ \t]/ { if (!fields) fail("malformed continuation line"); field[name] = field[name] "\n" $0; next }
+        {
+            separator = index($0, ":")
+            if (!separator) fail("malformed line")
+            name = tolower(substr($0, 1, separator - 1))
+            if (name in field) fail("duplicate field " name)
+            value = substr($0, separator + 1)
+            gsub(/^[ \t]+|[ \t]+$/, "", value)
+            field[name] = value
+            fields++
+        }
+        END {
+            if (failed) exit 1
+            check()
+            if (!count) fail("no active Debian source")
+            for (key in keyrings) print key
+        }' "$1"
+}
+
+# Print the first apt setting that weakens authentication or moves the source
+# lists elsewhere.
+apt_config_problem() {
+    apt-config dump | awk '
+        { key = tolower($1); value = $2; gsub(/^"|";?$/, "", value); value = tolower(value) }
+        key ~ /(^|::)(allowinsecurerepositories|allowdowngradetoinsecurerepositories|allowweakrepositories|allowunauthenticated)$/ &&
+            value !~ /^(false|no|off|0|disable|without)$/ { print $1; exit }
+        (key == "dir" && value != "/") ||
+            (key == "dir::etc" && value != "etc/apt/" && value != "etc/apt") ||
+            (key == "dir::etc::sourcelist" && value != "sources.list") ||
+            (key == "dir::etc::sourceparts" && value != "sources.list.d") { print $1; exit }'
+}
+
+# Add any missing required component to each active stanza, keeping the
+# existing components, their order, and every other line.
+enable_debian_components() {
+    awk -v required="$DEBIAN_COMPONENTS" '
+        function flush(   i, j, line, list, have, wanted, n) {
+            for (i = 1; i <= count; i++) {
+                line = lines[i]
+                if (active && tolower(line) ~ /^components:/) {
+                    n = split(substr(line, index(line, ":") + 1), list, " ")
+                    split("", have)
+                    for (j = 1; j <= n; j++) have[list[j]] = 1
+                    sub(/[ \t]+$/, "", line)
+                    n = split(required, wanted, " ")
+                    for (j = 1; j <= n; j++) if (!(wanted[j] in have)) line = line " " wanted[j]
+                }
+                print line
+            }
+            count = 0
+            active = 1
+        }
+        BEGIN { active = 1 }
+        /^[ \t]*$/ { flush(); print; next }
+        { lines[++count] = $0; if (tolower($0) ~ /^enabled:[ \t]*no[ \t]*$/) active = 0 }
+        END { flush() }' "$1"
+}
+
+unset APT_CONFIG
+[[ -f $DEBIAN_SOURCES ]] || die "Missing standard Debian source file $DEBIAN_SOURCES"
 if [[ -s $APT_DIR/sources.list ]]; then
-    die 'Additional apt sources in $APT_DIR/sources.list need review before installation.'
+    die "Additional apt sources in $APT_DIR/sources.list need review before installation."
 fi
-for source_file in $APT_DIR/sources.list.d/*.list $APT_DIR/sources.list.d/*.sources; do
+for source_file in "$APT_DIR"/sources.list.d/*.list "$APT_DIR"/sources.list.d/*.sources; do
     [[ -e $source_file ]] || continue
-    case $source_file in
-        $APT_DIR/sources.list.d/debian.sources|$APT_DIR/sources.list.d/vscode.list) ;;
-        *) die "Additional apt source needs review: $source_file" ;;
-    esac
+    [[ $source_file == "$DEBIAN_SOURCES" || $source_file == "$VSCODE_SOURCES" ]] || \
+        die "Additional apt source needs review: $source_file"
 done
+debian_keyrings=$(debian_source_keyrings "$DEBIAN_SOURCES") || \
+    die "Debian source needs review: $debian_keyrings"
+for keyring in $debian_keyrings; do
+    [[ -f $ROOT$keyring ]] || die "Missing Debian archive keyring $keyring"
+done
+apt_problem=$(apt_config_problem)
+[[ -z $apt_problem ]] || die "Apt setting $apt_problem needs review before installation."
 vscode_source='deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.asc.gpg] https://packages.microsoft.com/repos/code stable main'
-if [[ -e $APT_DIR/sources.list.d/vscode.list ]]; then
-    [[ $(cat $APT_DIR/sources.list.d/vscode.list) == "$vscode_source" ]] || \
+if [[ -e $VSCODE_SOURCES ]]; then
+    [[ $(cat "$VSCODE_SOURCES") == "$vscode_source" ]] || \
         die 'Existing VS Code apt source differs from the expected signed repository.'
     [[ -f $MICROSOFT_KEYRING ]] && \
         cmp -s "$SCRIPT_DIR/microsoft.asc.gpg" "$MICROSOFT_KEYRING" || \
@@ -154,28 +256,30 @@ if [[ -e $APT_DIR/sources.list.d/vscode.list ]]; then
 fi
 vscode_pins=$'Package: code\nPin: origin packages.microsoft.com\nPin-Priority: 600\n\nPackage: *\nPin: origin packages.microsoft.com\nPin-Priority: -1'
 if [[ -e $APT_DIR/preferences.d/devcarone-host-toolchain ]] && \
-    [[ $(cat $APT_DIR/preferences.d/devcarone-host-toolchain) != "$vscode_pins" ]]; then
+    [[ $(cat "$APT_DIR/preferences.d/devcarone-host-toolchain") != "$vscode_pins" ]]; then
     die 'Existing VS Code apt preferences differ from the installer policy.'
 fi
-printf '%s\n' "$vscode_pins" > $APT_DIR/preferences.d/devcarone-host-toolchain
-if grep -E '^URIs: ' $APT_DIR/sources.list.d/debian.sources | \
-    grep -Ev '^URIs: https?://(deb|security)\.debian\.org/(debian|debian-security)( |$)' >/dev/null; then
-    die 'Debian source contains an unexpected repository URI.'
-fi
-if ! grep -Eq '^Components: (.* )?non-free( |$)' $APT_DIR/sources.list.d/debian.sources; then
-    sed -i 's/^Components: main$/Components: main contrib non-free non-free-firmware/' \
-        $APT_DIR/sources.list.d/debian.sources
+
+printf '%s\n' "$vscode_pins" > "$APT_DIR/preferences.d/devcarone-host-toolchain"
+enable_debian_components "$DEBIAN_SOURCES" > "$DEBIAN_SOURCES.devcarone.$$"
+if cmp -s "$DEBIAN_SOURCES.devcarone.$$" "$DEBIAN_SOURCES"; then
+    rm -- "$DEBIAN_SOURCES.devcarone.$$"
+else
+    chmod --reference="$DEBIAN_SOURCES" -- "$DEBIAN_SOURCES.devcarone.$$"
+    chown --reference="$DEBIAN_SOURCES" -- "$DEBIAN_SOURCES.devcarone.$$"
+    mv -f -- "$DEBIAN_SOURCES.devcarone.$$" "$DEBIAN_SOURCES"
 fi
 apt-get update
 apt-get -y --no-install-recommends install ca-certificates curl gnupg jq xz-utils
-verify_key_file "$ROOT$debian_signed_by" "$DEBIAN_KEYS"
+for keyring in $debian_keyrings; do
+    verify_key_file "$ROOT$keyring" "$DEBIAN_KEYS"
+done
 verify_key_file "$SCRIPT_DIR/microsoft.asc.gpg" "$MICROSOFT_KEY"
 verify_key_file "$SCRIPT_DIR/keys/nodejs-release.asc" "$NODE_KEYS"
 verify_key_file "$SCRIPT_DIR/keys/teabot.asc" "$TEA_KEY"
 
 install -m 644 "$SCRIPT_DIR/microsoft.asc.gpg" "$MICROSOFT_KEYRING"
-printf '%s\n' "$vscode_source" \
-    > $APT_DIR/sources.list.d/vscode.list
+printf '%s\n' "$vscode_source" > "$VSCODE_SOURCES"
 apt-get update
 
 APT_PACKAGES=(
@@ -194,13 +298,24 @@ APT_PACKAGES=(
 # A matching name is not enough: the installed version must exist in the
 # expected signed apt repository. Debian packages may already be in a base OS.
 apt_origin_ok() {
-    local package=$1 version=$2 origin
-    if [[ $package == code ]]; then origin=packages.microsoft.com; else origin='debian.org'; fi
-    apt-cache policy "$package" | awk -v version="$version" -v origin="$origin" '
+    local package=$1 version=$2 code=0
+    [[ $package != code ]] || code=1
+    apt-cache policy "$package" | awk -v version="$version" -v code="$code" \
+        -v archive_uri="$DEBIAN_ARCHIVE_URI" -v archive_suites="$DEBIAN_ARCHIVE_SUITES" \
+        -v security_uri="$DEBIAN_SECURITY_URI" -v security_suites="$DEBIAN_SECURITY_SUITES" '
         $1 == "***" && $2 == version { in_version = 1; next }
         $1 == version { in_version = 1; next }
         in_version && /^     [^ ]/ { in_version = 0 }
-        in_version && index($0, origin) { found = 1 }
+        in_version {
+            suite = $3
+            sub(/\/.*/, "", suite)
+            if (code) {
+                if ($2 ~ /^https:\/\/packages[.]microsoft[.]com\/repos\/code\/?$/ && suite == "stable") found = 1
+            } else if (($2 ~ archive_uri && suite ~ archive_suites) ||
+                       ($2 ~ security_uri && suite ~ security_suites)) {
+                found = 1
+            }
+        }
         END { exit !found }
     '
 }
