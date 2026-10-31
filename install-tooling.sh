@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 # Build-time install. Optional third argument stages an installation for testing.
-# An optional fourth names a directory already holding the release binary and its
-# attestations.json; they are verified exactly as downloaded ones would be.
 set -euo pipefail
 MATT_REF=${1:?Matt Pocock commit or branch required}
 PLANNOTATOR_VERSION=${2:?Plannotator release tag required}
 DEST=${3:-}
-DOWNLOADED=${4:-}
 SOURCE_DIR=$DEST/opt/devcar/tooling
 BIN_DIR=$DEST/usr/local/bin
 TEMP_DIR=$(mktemp -d)
@@ -64,19 +61,15 @@ case $(uname -m) in
     aarch64|arm64) asset=plannotator-linux-arm64 ;;
     *) echo 'Unsupported Plannotator architecture.' >&2; exit 1 ;;
 esac
+release_url=https://github.com/backnotprop/plannotator/releases/download/$PLANNOTATOR_VERSION
+curl --fail --location --silent --show-error --retry 3 "$release_url/$asset" -o "$TEMP_DIR/$asset"
 # Plannotator publishes no GPG signatures, but GitHub records Sigstore SLSA
 # provenance for each release binary. Require the provenance to come from the
 # release workflow run for this exact tag.
-if [[ -n $DOWNLOADED ]]; then
-    cp -- "$DOWNLOADED/$asset" "$DOWNLOADED/attestations.json" "$TEMP_DIR/"
-else
-    release_url=https://github.com/backnotprop/plannotator/releases/download/$PLANNOTATOR_VERSION
-    curl --fail --location --silent --show-error --retry 3 "$release_url/$asset" -o "$TEMP_DIR/$asset"
-    digest=$(sha256sum "$TEMP_DIR/$asset" | cut -d' ' -f1)
-    curl --fail --location --silent --show-error --retry 3 \
-        "https://api.github.com/repos/backnotprop/plannotator/attestations/sha256:$digest" \
-        -o "$TEMP_DIR/attestations.json"
-fi
+digest=$(sha256sum "$TEMP_DIR/$asset" | cut -d' ' -f1)
+curl --fail --location --silent --show-error --retry 3 \
+    "https://api.github.com/repos/backnotprop/plannotator/attestations/sha256:$digest" \
+    -o "$TEMP_DIR/attestations.json"
 jq -e '[.attestations[].bundle | select(.dsseEnvelope.payload | @base64d | fromjson
         | .predicateType == "https://slsa.dev/provenance/v1")][0]' \
     "$TEMP_DIR/attestations.json" > "$TEMP_DIR/provenance.json"
