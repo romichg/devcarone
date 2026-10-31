@@ -228,6 +228,10 @@ working host X display. Audio is forwarded when `/run/user/$(id -u)/pulse` exist
 To install the same developer tools directly on a Debian Trixie amd64 machine
 or in another Debian image, without the container, use
 `install-host-toolchain.sh`; see [HOST-TOOLCHAIN.md](HOST-TOOLCHAIN.md).
+Existing host commands are preserved; managed npm commands use a private Node
+runtime, and command conflicts do not block installation of unrelated tools.
+The managed Plannotator launcher supplies browser defaults only to its process,
+respecting explicit environment values without creating a system-wide profile.
 
 ## Download verification
 
@@ -256,12 +260,12 @@ does not install them. `/opt/google/chrome/chrome` links to Debian's signed
 The `Dockerfile` keeps a commented-out step for Firefox and WebKit; uncomment it
 and rebuild to test with them, accepting unverified downloads.
 
-`install-host-toolchain.sh` uses the same trust roots, with these
-differences. It first checks that every apt source is the standard Debian
-archive or security repository signed by the Debian archive keyring, and that
-no apt setting weakens authentication. It installs the latest tea, Plannotator,
-and gogcli releases when they verify, otherwise the `Dockerfile` versions. gogcli's Go
-downloads go through a temporary local proxy (`go-ipv4-proxy.py`) that only
+`install-host-toolchain.sh` uses the same trust roots for standalone downloads.
+For apt packages it uses the host's configured repositories, keys, and policy,
+preserving existing sources and preferences. It adds a Microsoft source scoped
+to the bundled key only when `code` is neither installed nor available through
+apt. It installs the latest tea, Plannotator, and gogcli releases when they
+verify, otherwise the `Dockerfile` versions. gogcli's Go downloads go through a temporary local proxy (`go-ipv4-proxy.py`) that only
 forces IPv4; Go still verifies TLS and the checksum database. Its own state
 records live in `/var/lib/devcarone-host-toolchain`.
 

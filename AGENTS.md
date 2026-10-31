@@ -72,9 +72,15 @@ Keep it consistent with implementation changes.
   `/opt/devcar/bin/tea` to select that login.
 - `install-host-toolchain.sh` installs the image's toolchain on a Debian
   Trixie amd64 host or another image, without the container runtime; usage
-  and behavior are in `HOST-TOOLCHAIN.md`. It validates the apt sources before
-  apt runs, asks before changing installed packages unless `--update` is
-  given, and records what it owns in `/var/lib/devcarone-host-toolchain`.
+  and behavior are in `HOST-TOOLCHAIN.md`. It preserves the host's apt
+  configuration and delegates repository policy to apt. It adds a dedicated
+  Microsoft source only when `code` is neither installed nor available, asks
+  before changing installed packages unless `--update` is given, and records
+  what it owns in `/var/lib/devcarone-host-toolchain`. Existing host commands
+  are preserved per command; managed npm launchers use the private Node runtime.
+  The managed Plannotator launcher supplies defaults for unset browser/remote
+  variables locally to its process; host shell profiles are preserved except
+  for retirement of an exact stock profile from an earlier managed install.
   Node, npm generations, and skills generations live in
   `/usr/local/lib/devcarone-toolchain` and `/opt/devcar/host-toolchain`,
   activated by links. It reuses `install-tooling.sh`, passing a fourth

@@ -84,6 +84,8 @@ SUBSTITUTES = {
     # packages that installing it would remove.
     "apt-get": '''
 root=$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/apt
+[[ ! -f $root/fail ]] || { echo 'apt authentication failed' >&2; exit 100; }
+printf '%s\\n' "${APT_CONFIG:-}" > "$root/config-used"
 simulate=0 packages=() seen_install=0
 for argument; do
     case $argument in
@@ -114,11 +116,11 @@ for package in "${packages[@]}"; do
     done
 done
 ''',
-    # Defaults from apt-config dump plus any settings in apt/config.
+    # Resolve the host's effective source directory for optional VS Code setup.
     "apt-config": '''
-printf '%s\\n' 'Dir "/";' 'Dir::Etc "etc/apt/";' 'Dir::Etc::sourcelist "sources.list";' \\
-    'Dir::Etc::sourceparts "sources.list.d";' 'APT::Get::AllowUnauthenticated "false";'
-cat "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/apt/config" 2>/dev/null || true
+parts=$(cat "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/apt/source-parts" 2>/dev/null || \
+    echo "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/etc/apt/sources.list.d")
+printf "source_parts='%s'\\n" "$parts"
 ''',
     # Installed versions live in apt/installed/<package>.
     "dpkg-query": '''
@@ -127,7 +129,6 @@ state=$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/apt/installed/${@: -1}
 case $* in *Status*) echo 'ii ' ;; *) cat "$state" ;; esac
 ''',
     # Candidates default to 1.0 from suite apt/suite/<package> (default trixie).
-    # Like apt, the non-free driver has no candidate until non-free is enabled.
     "apt-cache": '''
 package=$2 root=$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/apt
 candidate=$(cat "$root/candidate/$package" 2>/dev/null || echo 1.0)
@@ -135,10 +136,8 @@ installed=$(cat "$root/installed/$package" 2>/dev/null || echo '(none)')
 suite=$(cat "$root/suite/$package" 2>/dev/null || echo trixie)
 origin=https://deb.debian.org/debian
 if [[ $package == code ]]; then origin=https://packages.microsoft.com/repos/code suite=stable; fi
-if [[ $package == intel-media-va-driver-non-free ]] && ! grep -Eq \\
-    '^Components:.* non-free( |$)' "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/etc/apt/sources.list.d/debian.sources"; then
-    candidate='(none)'
-fi
+parts=$(cat "$root/source-parts" 2>/dev/null || echo "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/etc/apt/sources.list.d")
+if [[ $package == code && -f $parts/devcarone-host-vscode.list ]]; then candidate=1.0; fi
 printf '%s:\\n  Installed: %s\\n  Candidate: %s\\n  Version table:\\n' \\
     "$package" "$installed" "$candidate"
 for version in $(printf '%s\\n%s\\n' "$candidate" "$installed" | grep -v none | sort -u); do
@@ -241,7 +240,7 @@ class InstallerRoot:
         (self.root / "etc/os-release").write_text("ID=debian\nVERSION_CODENAME=trixie\n")
         self.write("etc/apt/sources.list.d/debian.sources", DEBIAN_SOURCES)
         self.write("usr/share/keyrings/debian-archive-keyring.pgp",
-                   installer_value("DEBIAN_KEYS") + "\n")
+                   "host-managed-key\n")
         self._respond_to_known_releases()
 
     def write(self, relative, content, mode=0o644):
@@ -280,9 +279,9 @@ class InstallerRoot:
                      json.dumps({"tag_name": tag, "assets": [{"name": "plannotator-linux-x64"}]}))
         self.plannotator_artifacts(tag, binary, attestation)
 
-    def plannotator_artifacts(self, tag, binary=True, attestation="valid"):
+    def plannotator_artifacts(self, tag, binary=True, attestation="valid", content=None):
         asset = "plannotator-linux-x64"
-        content = f"plannotator {tag}".encode()
+        content = content if content is not None else f"plannotator {tag}".encode()
         self.respond(f"https://github.com/backnotprop/plannotator/releases/download/{tag}/{asset}",
                      content if binary else None)
         payload = base64.b64encode(json.dumps(
@@ -364,13 +363,14 @@ class InstallerRoot:
                 archive.addfile(info, io.BytesIO(data))
         return buffer.getvalue()
 
-    def run(self, *arguments, input="", terminal=None):
+    def run(self, *arguments, input="", terminal=None, extra_env=None):
         environment = {
             "PATH": str(self.root / "test-bin"),
             "HOME": str(self.root / "home"),
             "TMPDIR": str(self.root / "tmp"),
             "DEVCAR_HOST_TOOLCHAIN_TEST_ROOT": str(self.root),
         }
+        environment.update(extra_env or {})
         command = [str(self.root / "test-bin/bash"),
                    str(self.bundle / "install-host-toolchain.sh"), *arguments]
         if terminal is None:
@@ -401,16 +401,8 @@ class InstallerRoot:
         return log.read_text().splitlines() if log.exists() else []
 
 
-ARCHIVE_STANZA = """Types: deb
-URIs: https://deb.debian.org/debian
-Suites: trixie trixie-updates
-Components: {components}
-Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
-"""
-
-
 class HostInstallerSourceTests(unittest.TestCase):
-    """Apt configuration is validated completely before apt runs or anything changes."""
+    """Use the host's apt policy and preserve its existing configuration."""
 
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -418,115 +410,96 @@ class HostInstallerSourceTests(unittest.TestCase):
         self.system = InstallerRoot(directory.name)
         self.sources = self.system.root / "etc/apt/sources.list.d/debian.sources"
 
-    def use_sources(self, text):
-        self.sources.write_text(text)
+    def snapshot(self):
+        return {str(p): (p.read_bytes(), p.stat().st_mode, p.stat().st_ino)
+                for directory in ("etc/apt", "usr/share/keyrings")
+                for p in (self.system.root / directory).rglob("*") if p.is_file()}
 
-    def assertRefused(self, message):
-        before = self.sources.read_text()
+    def test_existing_host_sources_are_preserved(self):
+        self.system.write("etc/apt/sources.list", "# Host apt configuration\n")
+        self.system.write("etc/apt/sources.list.d/vendor.sources",
+                          "Types: deb\nURIs: https://packages.example.com/debian\n"
+                          "Suites: stable\nComponents: main\n")
+        self.sources.write_text(DEBIAN_SOURCES.replace(
+            "https://deb.debian.org/debian", "https://mirror.example.com/debian")
+            + "Check-Valid-Until: yes\n")
+        self.sources.chmod(0o640)
+        self.system.write("etc/apt/sources.list.d/vscode.list", "# Custom VS Code source\n")
+        self.system.write("etc/apt/preferences.d/devcarone-host-toolchain", "# Host pins\n")
+        self.system.write("usr/share/keyrings/microsoft.asc.gpg", "host key\n")
+        before = self.snapshot()
+        for arguments in ((), ("--update",)):
+            result = self.system.run(*arguments)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.snapshot(), before)
+
+    def test_legacy_sources_work_without_debian_sources_file(self):
+        self.sources.unlink()
+        self.system.write("etc/apt/sources.list",
+                          "deb https://mirror.example.com/debian trixie main non-free\n")
+        before = self.snapshot()
         result = self.system.run()
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn(message, result.stderr)
-        self.assertFalse([line for line in self.system.commands() if line.startswith("apt-get")])
-        self.assertEqual(self.sources.read_text(), before)
-        self.assertFalse((self.system.root / "etc/apt/preferences.d/devcarone-host-toolchain").exists())
-
-    def test_additional_uri_in_an_allowed_stanza_is_refused(self):
-        self.use_sources(DEBIAN_SOURCES.replace(
-            "URIs: https://deb.debian.org/debian",
-            "URIs: https://deb.debian.org/debian https://packages.example.com/debian", 1))
-        self.assertRefused("unexpected repository URI https://packages.example.com/debian")
-
-    def test_additional_stanza_with_another_repository_is_refused(self):
-        self.use_sources(DEBIAN_SOURCES + "\n" + ARCHIVE_STANZA.format(components="main").replace(
-            "https://deb.debian.org/debian", "https://mirror.example.com/debian"))
-        self.assertRefused("unexpected repository URI https://mirror.example.com/debian")
-
-    def test_trust_and_authentication_options_are_refused(self):
-        for option in ("Trusted: yes", "Allow-Insecure: yes", "Allow-Weak: yes"):
-            with self.subTest(option=option):
-                self.use_sources(DEBIAN_SOURCES.replace(
-                    "Components: main\n", f"Components: main\n{option}\n", 1))
-                self.assertRefused("unsupported option " + option.split(":")[0].lower())
-
-    def test_stanza_without_debian_keyring_scope_is_refused(self):
-        for replacement in ("", "Signed-By: /etc/apt/trusted.gpg.d/other.gpg\n",
-                            "Signed-By:\n -----BEGIN PGP PUBLIC KEY BLOCK-----\n"):
-            with self.subTest(replacement=replacement):
-                self.use_sources(DEBIAN_SOURCES.replace(
-                    "Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp\n", replacement, 1))
-                self.assertRefused("Signed-By must name the Debian archive keyring")
-
-    def test_unsupported_suites_are_refused(self):
-        for old, new in (("Suites: trixie trixie-updates", "Suites: trixie sid"),
-                         ("Suites: trixie trixie-updates", "Suites: trixie-security"),
-                         ("Suites: trixie-security", "Suites: trixie")):
-            with self.subTest(suites=new):
-                self.use_sources(DEBIAN_SOURCES.replace(old, new, 1))
-                self.assertRefused("unexpected suite")
-
-    def test_apt_settings_that_weaken_authentication_are_refused(self):
-        for setting in ('Acquire::AllowInsecureRepositories "true";',
-                        'Binary::apt-get::APT::Get::AllowUnauthenticated "1";',
-                        'Acquire::AllowDowngradeToInsecureRepositories "yes";',
-                        'Dir::Etc::sourceparts "/srv/apt/sources.d";'):
-            with self.subTest(setting=setting):
-                self.system.write("apt/config", setting + "\n")
-                self.assertRefused(f"Apt setting {setting.split()[0]} needs review")
-
-    def test_disabled_stanza_and_supported_suites_are_accepted(self):
-        disabled = ARCHIVE_STANZA.format(components="main").replace(
-            "https://deb.debian.org/debian", "https://mirror.example.com/debian") + "Enabled: no\n"
-        self.use_sources(DEBIAN_SOURCES.replace(
-            "Types: deb\n", "# Debian archive\nTypes: deb deb-src\n", 1).replace(
-            "trixie trixie-updates", "trixie trixie-updates trixie-backports", 1) + "\n" + disabled)
-
-        result = self.system.run()
-
         self.assertEqual(result.returncode, 0, result.stderr)
-        text = self.sources.read_text()
-        self.assertIn("# Debian archive\nTypes: deb deb-src\n", text)
-        self.assertIn("Components: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n"
-                      "Enabled: no\n", text)
+        self.assertEqual(self.snapshot(), before)
 
-    def test_installed_package_from_unsupported_suite_is_refused(self):
-        self.system.write("apt/installed/vim", "1.0\n")
-        self.system.write("apt/suite/vim", "sid\n")
-
+    def test_installed_package_without_repository_candidate_is_kept(self):
+        self.system.installed("vim", "1.0")
+        self.system.write("apt/candidate/vim", "(none)\n")
+        self.system.write("apt/suite/vim", "local\n")
         result = self.system.run()
-
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("vim 1.0 is not attributable to its expected apt repository", result.stderr)
-
-    def test_required_components_are_added_to_each_active_stanza_once(self):
-        cases = {
-            "main": "main contrib non-free non-free-firmware",
-            "main non-free-firmware": "main non-free-firmware contrib non-free",
-            "main contrib": "main contrib non-free non-free-firmware",
-            "main contrib non-free non-free-firmware": "main contrib non-free non-free-firmware",
-            "non-free-firmware main contrib non-free": "non-free-firmware main contrib non-free",
-        }
-        for existing, expected in cases.items():
-            with self.subTest(existing=existing):
-                self.use_sources(DEBIAN_SOURCES.replace("Components: main", f"Components: {existing}"))
-                before = self.sources.stat()
-                self.sources.chmod(0o640)
-
-                result = self.system.run("--update")
-
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(self.sources.read_text(), DEBIAN_SOURCES.replace(
-                    "Components: main", f"Components: {expected}"))
-                self.assertEqual(self.sources.stat().st_mode & 0o777, 0o640)
-                if existing == expected:
-                    self.assertEqual(self.sources.stat().st_ino, before.st_ino)
-
-    def test_enabling_non_free_makes_the_driver_candidate_available(self):
-        result = self.system.run()
-
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(" intel-media-va-driver-non-free ", next(
-            line for line in self.system.commands()
-            if line.startswith("apt-get -y --no-install-recommends install sudo")))
+        self.assertTrue(all("vim" not in packages for packages in self.system.apt_installs()))
+
+    def test_missing_driver_reports_candidate_without_enabling_components(self):
+        self.system.write("apt/candidate/intel-media-va-driver-non-free", "(none)\n")
+        before = self.snapshot()
+        result = self.system.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No apt candidate for intel-media-va-driver-non-free", result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_apt_failure_propagates_without_changing_sources(self):
+        self.system.write("apt/fail", "yes\n")
+        before = self.snapshot()
+        result = self.system.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("apt authentication failed", result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(self.system.apt_installs())
+
+    def test_apt_config_environment_is_preserved(self):
+        config = self.system.write("etc/apt/custom.conf", '# Host configuration\n')
+        result = self.system.run(extra_env={"APT_CONFIG": str(config)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.system.root / "apt/config-used").read_text().strip(), str(config))
+
+    def test_missing_code_adds_only_its_own_source_in_effective_directory(self):
+        self.system.write("apt/candidate/code", "(none)\n")
+        parts = self.system.root / "etc/apt/custom-sources"
+        self.system.write("apt/source-parts", str(parts))
+        before = self.snapshot()
+        result = self.system.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = self.snapshot()
+        self.assertEqual({name: after[name] for name in before}, before)
+        self.assertEqual(set(after) - set(before), {
+            str(parts / "devcarone-host-vscode.list"),
+            str(self.system.root / "usr/share/keyrings/devcarone-host-microsoft.gpg"),
+        })
+        self.assertIn("signed-by=/usr/share/keyrings/devcarone-host-microsoft.gpg",
+                      (parts / "devcarone-host-vscode.list").read_text())
+
+    def test_conflicting_installer_source_is_not_overwritten(self):
+        self.system.write("apt/candidate/code", "(none)\n")
+        # A dangling link must not become an output file.
+        target = self.system.root / "untouched"
+        (self.sources.parent / "devcarone-host-vscode.list").symlink_to(target)
+        before = self.snapshot()
+        result = self.system.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Keeping existing", result.stderr)
+        self.assertFalse(target.exists())
+        self.assertEqual(self.snapshot(), before)
 
 
 class HostInstallerAptConsentTests(unittest.TestCase):
@@ -696,7 +669,7 @@ class HostInstallerReleaseTests(unittest.TestCase):
                 self.assertEqual(system.tooling_tags(), [self.plannotator_known])
                 self.assertEqual(len(system.downloads(
                     f"releases/download/{self.plannotator_known}/plannotator-linux-x64")), 1)
-                self.assertEqual((system.root / "usr/local/bin/plannotator").read_bytes(),
+                self.assertEqual((system.root / f"usr/local/lib/devcarone-toolchain/plannotator/{self.plannotator_known}").read_bytes(),
                                  f"plannotator {self.plannotator_known}".encode())
 
     def test_unavailable_known_plannotator_release_fails_clearly(self):
@@ -717,7 +690,7 @@ class HostInstallerReleaseTests(unittest.TestCase):
         self.assertEqual(self.recorded("plannotator"), "v9.0.0")
         self.assertEqual(len(self.system.downloads("releases/download/v9.0.0/plannotator-linux-x64")), 1)
         self.assertEqual(len(self.system.downloads("plannotator/attestations/")), 1)
-        self.assertEqual((self.system.root / "usr/local/bin/plannotator").read_bytes(),
+        self.assertEqual((self.system.root / "usr/local/lib/devcarone-toolchain/plannotator/v9.0.0").read_bytes(),
                          b"plannotator v9.0.0")
 
     def test_invalid_plannotator_attestation_response_stops_the_run(self):
@@ -863,6 +836,187 @@ class ToolingInstallerDownloadTests(unittest.TestCase):
         self.assertFalse((self.root / "stage/usr/local/bin/plannotator").exists())
 
 
+class HostInstallerPlannotatorLauncherTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.system = InstallerRoot(directory.name)
+        self.profile = self.system.root / "etc/profile.d/devcarone-host-toolchain.sh"
+        self.payload = b'#!/bin/sh\nprintf "%s\\n" "$PLANNOTATOR_BROWSER" "$PLANNOTATOR_REMOTE" "$@"\nexit 7\n'
+        self.system.plannotator_artifacts(installer_value("PLANNOTATOR_KNOWN"), content=self.payload)
+
+    def test_launcher_defaults_and_overrides_without_a_login_shell(self):
+        result = self.system.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.profile.exists())
+        command = str(self.system.root / "usr/local/bin/plannotator")
+        for overrides, expected in (
+            ({}, [str(self.system.root / "usr/bin/chromium"), "0"]),
+            ({"PLANNOTATOR_BROWSER": "/custom/browser", "PLANNOTATOR_REMOTE": "1"},
+             ["/custom/browser", "1"]),
+            ({"PLANNOTATOR_BROWSER": "", "PLANNOTATOR_REMOTE": ""}, ["", ""]),
+        ):
+            with self.subTest(overrides=overrides):
+                result = subprocess.run([command, "argument with spaces", "--flag"],
+                                        env={"PATH": "/usr/bin:/bin", **overrides},
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 7, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), expected + ["argument with spaces", "--flag"])
+
+    def test_custom_profile_and_symlink_are_preserved(self):
+        custom = "# User settings\nexport PLANNOTATOR_REMOTE=1\n"
+        target = self.system.write("custom-profile", custom, 0o640)
+        self.profile.symlink_to(target)
+        for kind in ("symlink", "file", "dangling symlink"):
+            if kind == "file":
+                self.profile.unlink()
+                self.profile.write_text(custom)
+                self.profile.chmod(0o640)
+            elif kind == "dangling symlink":
+                self.profile.unlink()
+                self.profile.symlink_to(self.system.root / "missing-profile")
+            result = self.system.run("--update")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if kind == "file":
+                self.assertEqual(self.profile.read_text(), custom)
+                self.assertEqual(self.profile.stat().st_mode & 0o777, 0o640)
+            else:
+                self.assertTrue(self.profile.is_symlink())
+            self.assertEqual(target.read_text(), custom)
+            self.assertIn("Keeping existing Plannotator profile", result.stderr)
+
+    def test_stock_looking_profile_without_installation_record_is_preserved(self):
+        content = "export PLANNOTATOR_BROWSER=/usr/bin/chromium\nexport PLANNOTATOR_REMOTE=0\n"
+        self.profile.write_text(content)
+        result = self.system.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.profile.read_text(), content)
+
+    def test_retained_newer_direct_binary_is_migrated_to_launcher(self):
+        self.system.plannotator_release("v9.0.0")
+        self.system.plannotator_artifacts("v9.0.0", content=self.payload)
+        result = self.system.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Recreate the layout from before launchers were introduced.
+        command = self.system.root / "usr/local/bin/plannotator"
+        command.write_bytes(self.payload)
+        self.system.write("var/lib/devcarone-host-toolchain/plannotator.sha256",
+                          hashlib.sha256(self.payload).hexdigest() + "\n")
+        private = self.system.root / "usr/local/lib/devcarone-toolchain/plannotator/v9.0.0"
+        private.unlink()
+        self.system.plannotator_release("v9.1.0", binary=False)
+        result = self.system.run("--update")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        executed = subprocess.run([str(command)], env={"PATH": "/usr/bin:/bin"},
+                                  capture_output=True, text=True)
+        self.assertEqual(executed.returncode, 7, executed.stderr)
+        self.assertEqual(executed.stdout.splitlines(), [str(self.system.root / "usr/bin/chromium"), "0"])
+
+    def test_missing_retained_payload_does_not_turn_launcher_into_itself(self):
+        self.system.plannotator_release("v9.0.0")
+        self.system.plannotator_artifacts("v9.0.0", content=self.payload)
+        result = self.system.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        command = self.system.root / "usr/local/bin/plannotator"
+        before = command.read_bytes()
+        private = self.system.root / "usr/local/lib/devcarone-toolchain/plannotator/v9.0.0"
+        private.unlink()
+        self.system.plannotator_release("v9.1.0", binary=False)
+        result = self.system.run("--update")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Missing managed Plannotator payload", result.stderr)
+        self.assertEqual(command.read_bytes(), before)
+        self.assertFalse(private.exists())
+
+    def test_stock_profile_from_a_managed_install_is_retired(self):
+        old = self.system.write("usr/local/bin/plannotator", self.payload, 0o755)
+        self.system.write("var/lib/devcarone-host-toolchain/plannotator.sha256",
+                          hashlib.sha256(old.read_bytes()).hexdigest() + "\n")
+        self.system.write("var/lib/devcarone-host-toolchain/plannotator.version",
+                          installer_value("PLANNOTATOR_KNOWN") + "\n")
+        self.profile.write_text("export PLANNOTATOR_BROWSER=/usr/bin/chromium\nexport PLANNOTATOR_REMOTE=0\n")
+        result = self.system.run("--update")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.profile.exists())
+
+
+class HostInstallerExistingCommandTests(unittest.TestCase):
+    def test_existing_commands_are_preserved_on_install_and_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            system = InstallerRoot(directory)
+            files = {}
+            for name in ("node", "npm", "npx", "tea", "gog"):
+                path = system.write(f"usr/bin/{name}", "#!/bin/sh\nexit 77\n", 0o755)
+                files[path] = (path.read_bytes(), path.stat().st_ino)
+            path = system.write("usr/local/bin/claude", "#!/bin/sh\nexit 77\n", 0o755)
+            files[path] = (path.read_bytes(), path.stat().st_ino)
+            plannotator = system.root / "usr/local/bin/plannotator"
+            plannotator.symlink_to(system.root / "missing-custom-plannotator")
+            for arguments in ((), ("--update",)):
+                result = system.run(*arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for path, before in files.items():
+                    self.assertEqual((path.read_bytes(), path.stat().st_ino), before)
+                for name in ("node", "npm", "npx", "tea", "gog"):
+                    self.assertFalse((system.root / f"usr/local/bin/{name}").exists())
+                    self.assertIn(f"Keeping existing {name}", result.stderr)
+                self.assertEqual(plannotator.readlink(), system.root / "missing-custom-plannotator")
+                codex = system.root / "usr/local/bin/codex"
+                self.assertTrue(codex.exists())
+                npm_dir = (system.root / "usr/local/lib/devcarone-toolchain/current-npm").resolve()
+                (npm_dir / "node_modules/.bin/codex").write_text("#!/usr/bin/env node\n")
+                executed = subprocess.run([str(codex)], env={"PATH": str(system.root / "usr/bin")},
+                                          capture_output=True, text=True)
+                self.assertEqual(executed.returncode, 0, executed.stderr)
+                self.assertTrue((system.root / "opt/devcar/tooling/skills.list").exists())
+                state = system.root / "var/lib/devcarone-host-toolchain"
+                for name in ("tea", "gog", "plannotator"):
+                    self.assertFalse((state / f"{name}.sha256").exists())
+            # Refusing updates must accept a complete install with external tools.
+            result = system.run(terminal="n\n")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # Removing an external command allows a later update to provide it.
+            (system.root / "usr/bin/tea").unlink()
+            (system.root / "usr/local/bin/claude").unlink()
+            result = system.run("--update")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((state / "tea.sha256").exists())
+            self.assertTrue((system.root / "usr/local/bin/claude").is_symlink())
+
+    def test_legacy_managed_links_upgrade_to_private_runtime_launchers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            system = InstallerRoot(directory)
+            result = system.run()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            tools = system.root / "usr/local/lib/devcarone-toolchain"
+            for name, target in (("claude", tools / "current-npm/node_modules/.bin/claude"),
+                                 ("npm", tools / "current-node/bin/npm")):
+                link = system.root / "usr/local/bin" / name
+                link.unlink()
+                link.symlink_to(target)
+            result = system.run("--update")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((system.root / "usr/local/bin/claude").readlink(),
+                             tools / "current-npm/bin/claude")
+            self.assertEqual((system.root / "usr/local/bin/npm").readlink(),
+                             tools / "current-node/devcar-bin/npm")
+
+    def test_custom_code_and_chromium_do_not_install_apt_copies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            system = InstallerRoot(directory)
+            for name in ("code", "chromium"):
+                system.write(f"usr/local/bin/{name}", "#!/bin/sh\nexit 77\n", 0o755)
+                system.write(f"apt/candidate/{name}", "(none)\n")
+            result = system.run()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for packages in system.apt_installs():
+                self.assertNotIn("code", packages)
+                self.assertNotIn("chromium", packages)
+            self.assertFalse((system.root / "etc/apt/sources.list.d/devcarone-host-vscode.list").exists())
+            self.assertEqual((system.root / "opt/google/chrome/chrome").readlink(),
+                             system.root / "usr/local/bin/chromium")
+
+
 class HostInstallerRecoveryTests(unittest.TestCase):
     """An interrupted update leaves state that the next --update completes."""
 
@@ -987,7 +1141,7 @@ class HostInstallerBehaviorTests(unittest.TestCase):
         self.assertEqual(os.readlink(root / "usr/local/bin/node"),
                          f"{tool_dir}/current-node/bin/node")
         self.assertEqual(os.readlink(root / "usr/local/bin/claude"),
-                         f"{tool_dir}/current-npm/node_modules/.bin/claude")
+                         f"{tool_dir}/current-npm/bin/claude")
         for tool in ("tea", "gog", "plannotator"):
             self.assertTrue((root / f"usr/local/bin/{tool}").is_file(), tool)
         state = root / "var/lib/devcarone-host-toolchain"
@@ -995,10 +1149,9 @@ class HostInstallerBehaviorTests(unittest.TestCase):
         self.assertEqual((state / "tea.version").read_text(),
                          installer_value("TEA_KNOWN") + "\n")
         self.assertTrue(os.path.islink(root / "opt/devcar/tooling"))
-        self.assertIn("Components: main contrib non-free non-free-firmware",
-                      (root / "etc/apt/sources.list.d/debian.sources").read_text())
-        self.assertTrue((root / "etc/apt/sources.list.d/vscode.list").is_file())
-        self.assertTrue((root / "etc/profile.d/devcarone-host-toolchain.sh").is_file())
+        self.assertEqual((root / "etc/apt/sources.list.d/debian.sources").read_text(), DEBIAN_SOURCES)
+        self.assertFalse((root / "etc/apt/sources.list.d/vscode.list").exists())
+        self.assertFalse((root / "etc/profile.d/devcarone-host-toolchain.sh").exists())
         install = [line for line in self.system.commands()
                    if line.startswith("apt-get -y --no-install-recommends install sudo")]
         self.assertEqual(len(install), 1)
