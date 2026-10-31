@@ -23,8 +23,9 @@ non-root account. Without an account, it installs only the system tools and
 prints a reminder. To finish user configuration later, run the installer with
 `--update --user NAME`.
 
-The installed toolchain includes the Dockerfile's apt packages (including VS
-Code and Chromium), current Node.js LTS with its bundled npm, Codex, GitHub
+The installed toolchain includes the Dockerfile's developer apt packages
+(including VS Code and Chromium, but not its container session, desktop,
+SSH/VNC, logging, or graphics-driver packages), current Node.js LTS with its bundled npm, Codex, GitHub
 Copilot, opencode, pi, Claude Code, Firebase CLI, Playwright, tea, gogcli,
 Plannotator, and the shared Matt Pocock and Plannotator skills. The installer
 does not install Playwright browser downloads; Playwright should use Debian's
@@ -55,8 +56,8 @@ keyrings, preferences, and `APT_CONFIG`; both legacy `.list` and deb822
 `.sources` layouts are supported by apt itself. Installed packages do not
 need to remain available from their original repositories. If a required
 package is not installed and has no candidate, the installer names it and
-stops without rewriting the host's sources. For example, installing
-`intel-media-va-driver-non-free` requires an apt source that provides it.
+stops without rewriting the host's sources. For example, Microsoft's
+repository is added only when no `code` package is installed or available.
 
 If `code` is already installed or available through apt, that configuration is
 used. Otherwise the installer adds `devcarone-host-vscode.list` in apt's
