@@ -24,7 +24,7 @@ readonly TOOL_DIR=$ROOT/usr/local/lib/devcarone-toolchain
 readonly TOOLING_DIR=$ROOT/opt/devcar/tooling
 readonly BIN_DIR=$ROOT/usr/local/bin
 readonly APT_DIR=$ROOT/etc/apt
-readonly MICROSOFT_KEYRING=$ROOT/usr/share/keyrings/microsoft.asc.gpg
+readonly MICROSOFT_KEYRING=$ROOT/usr/share/keyrings/devcarone-host-microsoft.gpg
 readonly PROFILE_FILE=$ROOT/etc/profile.d/devcarone-host-toolchain.sh
 readonly TOOLING_GENERATIONS=$ROOT/opt/devcar/host-toolchain/tooling
 readonly NPM_REGISTRY=https://registry.npmjs.org/
@@ -65,20 +65,37 @@ require_file "$SCRIPT_DIR/go-ipv4-proxy.py"
 # shellcheck source=/dev/null
 . "$ROOT/etc/os-release"
 [[ ${ID:-} == debian && ${VERSION_CODENAME:-} == trixie ]] || die 'Debian Trixie is required.'
-for command_name in node npm codex copilot opencode pi claude firebase playwright tea gog plannotator; do
-    command_path=$(command -v "$command_name" || true)
-    if [[ -n $command_path && $command_path != $BIN_DIR/$command_name ]]; then
-        die "Unmanaged $command_name command is already on PATH at $command_path"
+# Existing host commands are not ours to replace or shadow. Detect collisions
+# per command, including non-executable files and dangling destination links.
+declare -A PRESERVED_COMMANDS=()
+preserve_command() {
+    local name=$1 expected=${2:-} binary=$BIN_DIR/$1 existing
+    [[ -z ${PRESERVED_COMMANDS[$name]:-} ]] || return 0
+    if [[ -e $binary || -L $binary ]]; then
+        if [[ -n $expected && -L $binary ]]; then
+            case $(readlink -- "$binary") in
+                "$expected"|"$TOOL_DIR/current-node/bin/$name"|"$TOOL_DIR/current-npm/node_modules/.bin/$name")
+                    return 1 ;;
+            esac
+        fi
+        if [[ -z $expected && -f $binary && ! -L $binary &&
+              ( -f $STATE_DIR/$name.sha256 || -f $STATE_DIR/$name.sha256.new ) ]]; then
+            return 1
+        fi
+        existing=$binary
+    else
+        existing=$(command -v "$name" || true)
+        [[ -n $existing ]] || return 1
     fi
-    if [[ $command_path == $BIN_DIR/$command_name && ! -d $STATE_DIR ]]; then
-        die "Unmanaged $command_name command is already installed at $command_path"
-    fi
-done
+    PRESERVED_COMMANDS[$name]=$existing
+    warn "Keeping existing $name at $existing; its command will not be installed or updated."
+}
 for command_name in code chromium; do
     command_path=$(command -v "$command_name" || true)
-    if [[ -n $command_path && $command_path != $ROOT/usr/bin/$command_name && \
+    if [[ -n $command_path && $command_path != $ROOT/usr/bin/$command_name &&
           $command_path != $ROOT/bin/$command_name ]]; then
-        die "Unmanaged $command_name command is already on PATH at $command_path"
+        PRESERVED_COMMANDS[$command_name]=$command_path
+        warn "Keeping existing $command_name at $command_path; skipping its apt package."
     fi
 done
 
@@ -120,114 +137,9 @@ verify_key_file() {
     ((found)) || die "No signing key in $file"
 }
 
-readonly DEBIAN_KEYS='04B54C3CDCA79751B16BC6B5225629DF75B188BD 5E04A1E3223A19A20706E20F9904613D4CCE68C6 41587F7DB8C774BCCF131416762F67A0B2C39DE4 B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8 05AB90340C0C5E797F44A8C8254CF3B5AEC0A8F0 4D64FEC119C2029067D6E791F8D2585B8783D481 1F89983E0081FDE018F3CC9673A4F27B8DD47936 AC530D520F2F3269F5E98313A48449044AAD5C5D A4285295FC7B1A81600062A9605C66F00D6C9793'
 readonly NODE_KEYS='5BE8A3F6C8A5C01D106C0AD820B1A390B168D356 DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7 CC68F5A3106FF448322E48ED27F5E38D5B0A215F 890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4 C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C 108F52B48DB57BB0CC439B2997B01419BD92F80A 655F3B5C1FB3FA8D1A0CA6BDE4A7D232B936D2FD A363A499291CBBC940DD62E41F10027AF002F8B0'
 readonly MICROSOFT_KEY=BC528686B50D79E339D3721CEB3E94ADBE1229CF
 readonly TEA_KEY=7C9E68152594688862D62AF62D9AE806EC1592E2
-
-# Apt authenticates the bootstrap packages before gpg/jq are available, so the
-# whole apt configuration is checked before any of it changes or apt runs.
-readonly DEBIAN_SOURCES=$APT_DIR/sources.list.d/debian.sources
-readonly VSCODE_SOURCES=$APT_DIR/sources.list.d/vscode.list
-# Bracket expressions keep these patterns intact when passed through awk -v.
-readonly DEBIAN_ARCHIVE_URI='^https?://deb[.]debian[.]org/debian/?$'
-readonly DEBIAN_ARCHIVE_SUITES='^trixie(-updates|-backports)?$'
-readonly DEBIAN_SECURITY_URI='^https?://security[.]debian[.]org/debian-security/?$'
-readonly DEBIAN_SECURITY_SUITES='^trixie-security$'
-readonly DEBIAN_KEYRING_PATHS='^/usr/share/keyrings/debian-archive-keyring[.](pgp|gpg)$'
-readonly DEBIAN_COMPONENTS='main contrib non-free non-free-firmware'
-
-# Print each active stanza's keyring, or the first problem and fail. Only plain
-# fields are accepted, so options such as Trusted or Allow-Insecure are refused.
-debian_source_keyrings() {
-    awk -v archive_uri="$DEBIAN_ARCHIVE_URI" -v archive_suites="$DEBIAN_ARCHIVE_SUITES" \
-        -v security_uri="$DEBIAN_SECURITY_URI" -v security_suites="$DEBIAN_SECURITY_SUITES" \
-        -v keyring_paths="$DEBIAN_KEYRING_PATHS" '
-        function fail(message) { print message; failed = 1; exit 1 }
-        function check(   key, i, j, uri_count, suite_count, uris, suites, types, suite_pattern) {
-            if (!fields) return
-            fields = 0
-            if (tolower(field["enabled"]) == "no") { split("", field); return }
-            for (key in field)
-                if (index(" types uris suites components signed-by enabled architectures ", " " key " ") == 0)
-                    fail("unsupported option " key)
-            if (field["enabled"] != "" && tolower(field["enabled"]) != "yes") fail("unsupported Enabled value")
-            if (!split(field["types"], types, " ")) fail("missing Types")
-            for (i in types) if (types[i] != "deb" && types[i] != "deb-src") fail("unsupported type " types[i])
-            if (field["signed-by"] !~ keyring_paths) fail("Signed-By must name the Debian archive keyring")
-            if (field["components"] == "") fail("missing Components")
-            uri_count = split(field["uris"], uris, " ")
-            suite_count = split(field["suites"], suites, " ")
-            if (!uri_count || !suite_count) fail("missing URIs or Suites")
-            for (i = 1; i <= uri_count; i++) {
-                if (uris[i] ~ archive_uri) suite_pattern = archive_suites
-                else if (uris[i] ~ security_uri) suite_pattern = security_suites
-                else fail("unexpected repository URI " uris[i])
-                for (j = 1; j <= suite_count; j++)
-                    if (suites[j] !~ suite_pattern) fail("unexpected suite " suites[j] " for " uris[i])
-            }
-            if (!(field["signed-by"] in keyrings)) { keyrings[field["signed-by"]] = 1; count++ }
-            split("", field)
-        }
-        /^#/ { next }
-        /^[ \t]*$/ { check(); next }
-        /^[ \t]/ { if (!fields) fail("malformed continuation line"); field[name] = field[name] "\n" $0; next }
-        {
-            separator = index($0, ":")
-            if (!separator) fail("malformed line")
-            name = tolower(substr($0, 1, separator - 1))
-            if (name in field) fail("duplicate field " name)
-            value = substr($0, separator + 1)
-            gsub(/^[ \t]+|[ \t]+$/, "", value)
-            field[name] = value
-            fields++
-        }
-        END {
-            if (failed) exit 1
-            check()
-            if (!count) fail("no active Debian source")
-            for (key in keyrings) print key
-        }' "$1"
-}
-
-# Print the first apt setting that weakens authentication or moves the source
-# lists elsewhere.
-apt_config_problem() {
-    apt-config dump | awk '
-        { key = tolower($1); value = $2; gsub(/^"|";?$/, "", value); value = tolower(value) }
-        key ~ /(^|::)(allowinsecurerepositories|allowdowngradetoinsecurerepositories|allowweakrepositories|allowunauthenticated)$/ &&
-            value !~ /^(false|no|off|0|disable|without)$/ { print $1; exit }
-        (key == "dir" && value != "/") ||
-            (key == "dir::etc" && value != "etc/apt/" && value != "etc/apt") ||
-            (key == "dir::etc::sourcelist" && value != "sources.list") ||
-            (key == "dir::etc::sourceparts" && value != "sources.list.d") { print $1; exit }'
-}
-
-# Add any missing required component to each active stanza, keeping the
-# existing components, their order, and every other line.
-enable_debian_components() {
-    awk -v required="$DEBIAN_COMPONENTS" '
-        function flush(   i, j, line, list, have, wanted, n) {
-            for (i = 1; i <= count; i++) {
-                line = lines[i]
-                if (active && tolower(line) ~ /^components:/) {
-                    n = split(substr(line, index(line, ":") + 1), list, " ")
-                    split("", have)
-                    for (j = 1; j <= n; j++) have[list[j]] = 1
-                    sub(/[ \t]+$/, "", line)
-                    n = split(required, wanted, " ")
-                    for (j = 1; j <= n; j++) if (!(wanted[j] in have)) line = line " " wanted[j]
-                }
-                print line
-            }
-            count = 0
-            active = 1
-        }
-        BEGIN { active = 1 }
-        /^[ \t]*$/ { flush(); print; next }
-        { lines[++count] = $0; if (tolower($0) ~ /^enabled:[ \t]*no[ \t]*$/) active = 0 }
-        END { flush() }' "$1"
-}
 
 # Treat end of input or anything but yes as refusal.
 confirm() {
@@ -246,46 +158,20 @@ installed_version() {
     fi
 }
 
-# A matching name is not enough: the installed version must exist in the
-# expected signed apt repository. Debian packages may already be in a base OS.
-apt_origin_ok() {
-    local package=$1 version=$2 code=0
-    [[ $package != code ]] || code=1
-    apt-cache policy "$package" | awk -v version="$version" -v code="$code" \
-        -v archive_uri="$DEBIAN_ARCHIVE_URI" -v archive_suites="$DEBIAN_ARCHIVE_SUITES" \
-        -v security_uri="$DEBIAN_SECURITY_URI" -v security_suites="$DEBIAN_SECURITY_SUITES" '
-        $1 == "***" && $2 == version { in_version = 1; next }
-        $1 == version { in_version = 1; next }
-        in_version && /^     [^ ]/ { in_version = 0 }
-        in_version {
-            suite = $3
-            sub(/\/.*/, "", suite)
-            if (code) {
-                if ($2 ~ /^https:\/\/packages[.]microsoft[.]com\/repos\/code\/?$/ && suite == "stable") found = 1
-            } else if (($2 ~ archive_uri && suite ~ archive_suites) ||
-                       ($2 ~ security_uri && suite ~ security_suites)) {
-                found = 1
-            }
-        }
-        END { exit !found }
-    '
-}
-
 # Set APT_REQUEST to the packages that are missing or have a newer candidate.
 # Requesting only those leaves up-to-date packages' manual/automatic marks alone.
 select_apt_packages() {
     local package installed candidate
     APT_REQUEST=()
     for package; do
+        [[ -z ${PRESERVED_COMMANDS[$package]:-} ]] || continue
         installed=$(installed_version "$package")
         candidate=$(apt-cache policy "$package" | awk '/Candidate:/ { print $2; exit }')
-        [[ -n $candidate && $candidate != '(none)' ]] || die "No signed apt candidate for $package"
-        if [[ -z $installed ]]; then
-            APT_REQUEST+=("$package")
-        else
-            apt_origin_ok "$package" "$installed" || die "$package $installed is not attributable to its expected apt repository."
-            [[ $installed == "$candidate" ]] || APT_REQUEST+=("$package")
+        if [[ -z $candidate || $candidate == '(none)' ]]; then
+            [[ -n $installed ]] && continue
+            die "No apt candidate for $package; make it available in the host's apt configuration and rerun. Existing sources were left unchanged."
         fi
+        [[ $installed == "$candidate" ]] || APT_REQUEST+=("$package")
     done
 }
 
@@ -324,59 +210,42 @@ apt_install() {
     apt-get -y --no-install-recommends install "$@"
 }
 
-unset APT_CONFIG
-[[ -f $DEBIAN_SOURCES ]] || die "Missing standard Debian source file $DEBIAN_SOURCES"
-if [[ -s $APT_DIR/sources.list ]]; then
-    die "Additional apt sources in $APT_DIR/sources.list need review before installation."
-fi
-for source_file in "$APT_DIR"/sources.list.d/*.list "$APT_DIR"/sources.list.d/*.sources; do
-    [[ -e $source_file ]] || continue
-    [[ $source_file == "$DEBIAN_SOURCES" || $source_file == "$VSCODE_SOURCES" ]] || \
-        die "Additional apt source needs review: $source_file"
-done
-debian_keyrings=$(debian_source_keyrings "$DEBIAN_SOURCES") || \
-    die "Debian source needs review: $debian_keyrings"
-for keyring in $debian_keyrings; do
-    [[ -f $ROOT$keyring ]] || die "Missing Debian archive keyring $keyring"
-done
-apt_problem=$(apt_config_problem)
-[[ -z $apt_problem ]] || die "Apt setting $apt_problem needs review before installation."
-vscode_source='deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.asc.gpg] https://packages.microsoft.com/repos/code stable main'
-if [[ -e $VSCODE_SOURCES ]]; then
-    [[ $(cat "$VSCODE_SOURCES") == "$vscode_source" ]] || \
-        die 'Existing VS Code apt source differs from the expected signed repository.'
-    [[ -f $MICROSOFT_KEYRING ]] && \
-        cmp -s "$SCRIPT_DIR/microsoft.asc.gpg" "$MICROSOFT_KEYRING" || \
-        die 'Existing Microsoft apt key differs from the trusted bundle.'
-fi
-vscode_pins=$'Package: code\nPin: origin packages.microsoft.com\nPin-Priority: 600\n\nPackage: *\nPin: origin packages.microsoft.com\nPin-Priority: -1'
-if [[ -e $APT_DIR/preferences.d/devcarone-host-toolchain ]] && \
-    [[ $(cat "$APT_DIR/preferences.d/devcarone-host-toolchain") != "$vscode_pins" ]]; then
-    die 'Existing VS Code apt preferences differ from the installer policy.'
-fi
-
-printf '%s\n' "$vscode_pins" > "$APT_DIR/preferences.d/devcarone-host-toolchain"
-enable_debian_components "$DEBIAN_SOURCES" > "$DEBIAN_SOURCES.devcarone.$$"
-if cmp -s "$DEBIAN_SOURCES.devcarone.$$" "$DEBIAN_SOURCES"; then
-    rm -- "$DEBIAN_SOURCES.devcarone.$$"
-else
-    chmod --reference="$DEBIAN_SOURCES" -- "$DEBIAN_SOURCES.devcarone.$$"
-    chown --reference="$DEBIAN_SOURCES" -- "$DEBIAN_SOURCES.devcarone.$$"
-    mv -f -- "$DEBIAN_SOURCES.devcarone.$$" "$DEBIAN_SOURCES"
-fi
+# The host owns apt's sources, keys, preferences, and configuration. Let apt
+# resolve and authenticate packages; do not impose the image's source layout.
 apt-get update
 select_apt_packages ca-certificates curl gnupg jq xz-utils
 apt_install "${APT_REQUEST[@]}"
-for keyring in $debian_keyrings; do
-    verify_key_file "$ROOT$keyring" "$DEBIAN_KEYS"
-done
 verify_key_file "$SCRIPT_DIR/microsoft.asc.gpg" "$MICROSOFT_KEY"
 verify_key_file "$SCRIPT_DIR/keys/nodejs-release.asc" "$NODE_KEYS"
 verify_key_file "$SCRIPT_DIR/keys/teabot.asc" "$TEA_KEY"
 
-install -m 644 "$SCRIPT_DIR/microsoft.asc.gpg" "$MICROSOFT_KEYRING"
-printf '%s\n' "$vscode_source" > "$VSCODE_SOURCES"
-apt-get update
+# Reuse an installed or available VS Code package. Only provision a repository
+# if the host has neither, using dedicated files without changing its sources.
+code_candidate=$(apt-cache policy code | awk '/Candidate:/ { print $2; exit }')
+if [[ -z ${PRESERVED_COMMANDS[code]:-} && -z $(installed_version code) && ( -z $code_candidate || $code_candidate == '(none)' ) ]]; then
+    # apt-config's shell output quotes values for evaluation and /d resolves
+    # the effective directory, including APT_CONFIG and Dir overrides.
+    source_parts=$APT_DIR/sources.list.d
+    source_config=$(apt-config shell source_parts Dir::Etc::sourceparts/d)
+    eval "$source_config"
+    vscode_source_file=$source_parts/devcarone-host-vscode.list
+    vscode_source='deb [arch=amd64 signed-by=/usr/share/keyrings/devcarone-host-microsoft.gpg] https://packages.microsoft.com/repos/code stable main'
+    if [[ -e $vscode_source_file || -L $vscode_source_file ]]; then
+        [[ -f $vscode_source_file && $(cat "$vscode_source_file") == "$vscode_source" ]] || \
+            die "Keeping existing $vscode_source_file; configure an apt candidate for code and rerun."
+    fi
+    if [[ -e $MICROSOFT_KEYRING || -L $MICROSOFT_KEYRING ]]; then
+        cmp -s "$SCRIPT_DIR/microsoft.asc.gpg" "$MICROSOFT_KEYRING" || \
+            die "Keeping existing $MICROSOFT_KEYRING; configure an apt candidate for code and rerun."
+    else
+        install -m 644 "$SCRIPT_DIR/microsoft.asc.gpg" "$MICROSOFT_KEYRING"
+    fi
+    if [[ ! -e $vscode_source_file ]]; then
+        mkdir -p "$source_parts"
+        printf '%s\n' "$vscode_source" > "$vscode_source_file"
+    fi
+    apt-get update
+fi
 
 APT_PACKAGES=(
     sudo procps locales lsof file dialog gosu tzdata
@@ -394,17 +263,26 @@ APT_PACKAGES=(
 
 select_apt_packages "${APT_PACKAGES[@]}"
 apt_install "${APT_REQUEST[@]}"
-plannotator_profile=$'export PLANNOTATOR_BROWSER=/usr/bin/chromium\nexport PLANNOTATOR_REMOTE=0'
-if [[ -e "$PROFILE_FILE" ]] && \
-    [[ $(cat "$PROFILE_FILE") != "$plannotator_profile" ]]; then
-    die 'Existing Plannotator environment profile differs from the installer policy.'
+chromium_command=${PRESERVED_COMMANDS[chromium]:-$ROOT/usr/bin/chromium}
+# Retire only the stock profile from an earlier managed installation. Custom
+# profiles and symlinks belong to the host; never rewrite or source them.
+printf '%s\n' 'export PLANNOTATOR_BROWSER=/usr/bin/chromium' \
+    'export PLANNOTATOR_REMOTE=0' > "$WORK/stock-plannotator-profile"
+RETIRE_PLANNOTATOR_PROFILE=0
+if [[ -e $PROFILE_FILE || -L $PROFILE_FILE ]]; then
+    if [[ -f $STATE_DIR/plannotator.sha256 && -f $PROFILE_FILE && ! -L $PROFILE_FILE &&
+          $(stat -c %u "$PROFILE_FILE") == "$OWNER_UID" ]] &&
+        cmp -s "$PROFILE_FILE" "$WORK/stock-plannotator-profile"; then
+        RETIRE_PLANNOTATOR_PROFILE=1
+    else
+        warn "Keeping existing Plannotator profile $PROFILE_FILE; its settings may override launcher defaults."
+    fi
 fi
-printf '%s\n' "$plannotator_profile" > "$PROFILE_FILE"
 
 # Playwright's "chrome" channel runs /opt/google/chrome/chrome; point it at
 # Debian's signed Chromium, as the image does, unless a browser is already there.
 chrome_link=$ROOT/opt/google/chrome/chrome
-if [[ -L $chrome_link && $(readlink -- "$chrome_link") == "$ROOT/usr/bin/chromium" ]]; then
+if [[ -L $chrome_link && $(readlink -- "$chrome_link") == "$chromium_command" ]]; then
     :
 elif [[ -e $chrome_link || -L $chrome_link ]]; then
     warn "Keeping the existing $chrome_link for Playwright's chrome channel."
@@ -416,7 +294,7 @@ else
         (( (8#$(stat -c %a "$chrome_dir") & 0022) == 0 )) || \
             die "Browser directory is writable by non-root users: $chrome_dir"
     done
-    ln -s -- "$ROOT/usr/bin/chromium" "$chrome_link"
+    ln -s -- "$chromium_command" "$chrome_link"
 fi
 
 mkdir -p "$BIN_DIR" "$STATE_DIR" "$TOOL_DIR/node" "$TOOL_DIR/npm" "$TOOLING_GENERATIONS"
@@ -434,11 +312,10 @@ for state_file in "$STATE_DIR"/*; do
     permissions=$(stat -c %a "$state_file")
     (( (8#$permissions & 0022) == 0 )) || die "Writable state file: $state_file"
 done
-managed_link() {
+publish_command() {
     local link=$1 expected=$2
-    if [[ -e $link || -L $link ]]; then
-        [[ -L $link && $(readlink -- "$link") == "$expected" ]] || die "Unmanaged install at $link"
-    fi
+    preserve_command "${link##*/}" "$expected" && return 0
+    set_link "$link" "$expected"
 }
 # The tool and tooling generation directories are root-owned and used only by
 # this installer, so a link into them is the installer's even when an
@@ -459,6 +336,7 @@ set_link() {
 # before an interrupted replacement.
 managed_binary() {
     local name=$1 binary=$BIN_DIR/$1 hash
+    preserve_command "$name" && return 0
     if [[ -e $binary || -L $binary ]]; then
         [[ -f $STATE_DIR/$name.sha256 || -f $STATE_DIR/$name.sha256.new ]] || die "Unmanaged install at $binary"
         [[ -f $binary && ! -L $binary ]] || die "Unexpected managed binary type at $binary"
@@ -469,12 +347,39 @@ managed_binary() {
 }
 install_managed_binary() {
     local source=$1 name=$2 version=$3 target=$BIN_DIR/$2
+    preserve_command "$name" && return 0
     sha256sum "$source" | awk '{print $1}' > "$STATE_DIR/$name.sha256.new"
     install -m 755 -- "$source" "$target.devcarone-new"
     mv -f -- "$target.devcarone-new" "$target"
     printf '%s\n' "$version" > "$STATE_DIR/$name.version"
     mv -f -- "$STATE_DIR/$name.sha256.new" "$STATE_DIR/$name.sha256"
 }
+# Keep browser defaults local to Plannotator, including non-login launches.
+install_plannotator() {
+    local source=$1 version=$2 payload launcher=$WORK/plannotator-launcher
+    preserve_command plannotator && return 0
+    [[ $version =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || die "Invalid Plannotator version $version"
+    payload=$TOOL_DIR/plannotator/$version
+    mkdir -p "${payload%/*}"
+    if [[ $source != "$payload" ]]; then
+        install -m 755 -- "$source" "$payload.new"
+        mv -f -- "$payload.new" "$payload"
+        sha256sum "$payload" | awk '{print $1}' > "$payload.sha256"
+    fi
+    {
+        printf '#!/bin/bash\n# devcarone Plannotator launcher\n'
+        printf 'if [[ ! ${PLANNOTATOR_BROWSER+x} ]]; then PLANNOTATOR_BROWSER=%q; fi\n' "$chromium_command"
+        printf 'export PLANNOTATOR_BROWSER\nexport PLANNOTATOR_REMOTE=${PLANNOTATOR_REMOTE-0}\n'
+        printf 'exec %q "$@"\n' "$payload"
+    } > "$launcher"
+    install_managed_binary "$launcher" plannotator "$version"
+    if ((RETIRE_PLANNOTATOR_PROFILE)) && [[ ! -L $PROFILE_FILE ]] &&
+        cmp -s "$PROFILE_FILE" "$WORK/stock-plannotator-profile"; then
+        rm -- "$PROFILE_FILE"
+        warn 'Removed the old stock Plannotator profile; existing shells retain their environment until restarted or unset.'
+    fi
+}
+
 # Remove superseded entries of an installer-owned DIRECTORY whose names match
 # PATTERN, keeping the named entries: the new one and the one active before
 # this run, which agents started earlier may still be using. Unrecognized
@@ -491,9 +396,6 @@ prune_generations() {
 readonly NODE_RELEASE_NAME='^[0-9]+[.][0-9]+[.][0-9]+([.]replaced[.][0-9]+)?$'
 readonly GENERATION_NAME='^[0-9]{8}T[0-9]{6}Z-[0-9]+$'
 
-for name in node npm npx corepack; do
-    managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-node/bin/$name"
-done
 managed_link_within "$TOOL_DIR/current-node" "$TOOL_DIR/node"
 managed_link_within "$TOOL_DIR/current-npm" "$TOOL_DIR/npm"
 managed_link_within "$TOOLING_DIR" "$TOOLING_GENERATIONS"
@@ -526,6 +428,7 @@ if [[ -e $STATE_DIR/node-version || -e $STATE_DIR/npm-generation || \
 fi
 if ((!INSTALL_MANAGED)); then
     for marker in node-version npm-generation tea.sha256 gog.sha256 plannotator.sha256 tooling-target; do
+        [[ -z ${PRESERVED_COMMANDS[${marker%.sha256}]:-} ]] || continue
         [[ -f $STATE_DIR/$marker ]] || die "Incomplete managed installation; rerun with --update ($marker missing)."
     done
 fi
@@ -567,24 +470,9 @@ PATH=$node_stage/bin:$SYSTEM_PATH "$node_stage/bin/npm" install --prefix "$npm_s
     --registry="$NPM_REGISTRY" --ignore-scripts "${NPM_PACKAGES[@]}"
 PATH=$node_stage/bin:$SYSTEM_PATH "$node_stage/bin/npm" audit signatures --prefix "$npm_stage" \
     --registry="$NPM_REGISTRY" || die 'npm registry signature or provenance audit failed.'
-for binary in "$npm_stage"/node_modules/.bin/*; do
-    [[ -e $binary || -L $binary ]] || continue
-    name=${binary##*/}
-    managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-npm/node_modules/.bin/$name"
-done
 PATH=$node_stage/bin:$SYSTEM_PATH "$node_stage/bin/npm" rebuild --prefix "$npm_stage" \
     --registry="$NPM_REGISTRY" @openai/codex @github/copilot opencode-ai \
     @anthropic-ai/claude-code firebase-tools @playwright/test
-
-for binary in "$npm_stage"/node_modules/.bin/*; do
-    [[ -e $binary || -L $binary ]] || continue
-    name=${binary##*/}
-    managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-npm/node_modules/.bin/$name"
-done
-for binary in "$node_stage"/bin/*; do
-    name=${binary##*/}
-    managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-node/bin/$name"
-done
 
 # Keep the active release when it is intact. Replace an existing directory
 # that other accounts could modify or that an interrupted run left inactive.
@@ -600,22 +488,47 @@ elif [[ $node_release != "$active_node" || -n $(untrusted_file "$node_release") 
     mv -- "$node_stage" "$node_release"
     rm -rf -- "$node_release.replaced.$$"
 fi
+# Managed npm commands use the verified private Node runtime even when the
+# host keeps a different Node version. Launchers belong to their generations.
+write_launcher() {
+    local destination=$1 command=$2
+    {
+        printf '#!/bin/bash\n'
+        printf 'export PATH=%q:"$PATH"\n' "$node_release/bin"
+        printf 'exec %q "$@"\n' "$command"
+    } > "$destination"
+    chmod 755 "$destination"
+}
+mkdir -p "$node_release/devcar-bin"
+for binary in "$node_release"/bin/*; do
+    [[ ${binary##*/} == node ]] && continue
+    write_launcher "$node_release/devcar-bin/${binary##*/}" "$binary"
+done
 npm_generation=$(date -u +%Y%m%dT%H%M%SZ)-$$
+mkdir "$npm_stage/bin"
+for binary in "$npm_stage"/node_modules/.bin/*; do
+    [[ -e $binary || -L $binary ]] || continue
+    write_launcher "$npm_stage/bin/${binary##*/}" "$TOOL_DIR/npm/$npm_generation/node_modules/.bin/${binary##*/}"
+done
 mv -- "$npm_stage" "$TOOL_DIR/npm/$npm_generation"
 set_link "$TOOL_DIR/current-node" "$TOOL_DIR/node/$node_version"
 set_link "$TOOL_DIR/current-npm" "$TOOL_DIR/npm/$npm_generation"
-for binary in "$TOOL_DIR/node/$node_version"/bin/*; do
-    set_link "$BIN_DIR/${binary##*/}" "$TOOL_DIR/current-node/bin/${binary##*/}"
+for binary in "$node_release"/bin/*; do
+    name=${binary##*/}
+    target=$TOOL_DIR/current-node/devcar-bin/$name
+    [[ $name != node ]] || target=$TOOL_DIR/current-node/bin/node
+    publish_command "$BIN_DIR/$name" "$target"
 done
-for binary in "$TOOL_DIR/npm/$npm_generation"/node_modules/.bin/*; do
-    set_link "$BIN_DIR/${binary##*/}" "$TOOL_DIR/current-npm/node_modules/.bin/${binary##*/}"
+for binary in "$TOOL_DIR/npm/$npm_generation/bin"/*; do
+    publish_command "$BIN_DIR/${binary##*/}" "$TOOL_DIR/current-npm/bin/${binary##*/}"
 done
 # Remove the installer's command links that no active generation provides,
 # including links an interrupted run created. Name records are no longer kept.
 for link in "$BIN_DIR"/*; do
     [[ -L $link && ! -e $link ]] || continue
     case $(readlink -- "$link") in
-        "$TOOL_DIR/current-node/bin/${link##*/}"|"$TOOL_DIR/current-npm/node_modules/.bin/${link##*/}")
+        "$TOOL_DIR/current-node/bin/${link##*/}"|"$TOOL_DIR/current-node/devcar-bin/${link##*/}"|\
+        "$TOOL_DIR/current-npm/node_modules/.bin/${link##*/}"|"$TOOL_DIR/current-npm/bin/${link##*/}")
             rm -f -- "$link" ;;
     esac
 done
@@ -684,6 +597,7 @@ fetch_tea() {
             -o "$WORK/tea-$tag/$file" || return 1
     done
 }
+if [[ -z ${PRESERVED_COMMANDS[tea]:-} ]]; then
 tea_tag=$(select_tag tea https://gitea.com/api/v1/repos/gitea/tea/releases/latest "$TEA_KNOWN" "$WORK/tea-release.json")
 tea_tag=$(fetch_release tea "$tea_tag" "$TEA_KNOWN" fetch_tea)
 if [[ -n $tea_tag ]]; then
@@ -697,6 +611,7 @@ tea_hash=$(awk -v file="$tea_asset" '$2 == file { print $1 }' "$tea_dir/checksum
 [[ $tea_hash =~ ^[a-fA-F0-9]{64}$ ]] || die 'tea asset is absent from its signed checksum list.'
 printf '%s  %s\n' "$tea_hash" "$tea_dir/$tea_asset" | sha256sum -c - >/dev/null || die 'tea checksum failed.'
 install_managed_binary "$tea_dir/$tea_asset" tea "$tea_tag"
+fi
 fi
 
 # Download the release binary and its attestations once; the tooling installer
@@ -741,9 +656,25 @@ mv -- "$tooling_stage/opt/devcar/tooling" "$tooling_target"
 set_link "$TOOLING_DIR" "$tooling_target"
 printf '%s\n' "$tooling_target" > "$STATE_DIR/tooling-target"
 prune_generations "$TOOLING_GENERATIONS" "$GENERATION_NAME" "$tooling_generation" "${active_tooling##*/}"
-install_managed_binary "$tooling_stage/usr/local/bin/plannotator" plannotator "$plannotator_tag"
+install_plannotator "$tooling_stage/usr/local/bin/plannotator" "$plannotator_tag"
+elif [[ -z ${PRESERVED_COMMANDS[plannotator]:-} ]]; then
+    # A fallback can retain a newer release. Migrate its old direct binary too.
+    retained_version=$(cat "$STATE_DIR/plannotator.version")
+    [[ $retained_version =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || die 'Invalid recorded Plannotator version.'
+    retained_payload=$TOOL_DIR/plannotator/$retained_version
+    if [[ -f $retained_payload ]]; then
+        [[ $(sha256sum "$retained_payload" | awk '{print $1}') == "$(cat "$retained_payload.sha256")" ]] || \
+            die 'Managed Plannotator payload changed.'
+    else
+        if grep -q '^# devcarone Plannotator launcher$' "$BIN_DIR/plannotator"; then
+            die "Missing managed Plannotator payload $retained_payload"
+        fi
+        retained_payload=$BIN_DIR/plannotator
+    fi
+    install_plannotator "$retained_payload" "$retained_version"
 fi
 
+if [[ -z ${PRESERVED_COMMANDS[gog]:-} ]]; then
 gog_tag=$(select_tag gogcli https://api.github.com/repos/openclaw/gogcli/releases/latest \
     "$GOG_KNOWN" "$WORK/gog-release.json")
 mkdir "$WORK/go" "$WORK/go-cache" "$WORK/go-bin"
@@ -780,6 +711,7 @@ fi
 kill "$GO_PROXY_PID" 2>/dev/null || true
 wait "$GO_PROXY_PID" 2>/dev/null || true
 GO_PROXY_PID=
+fi
 fi
 
 if [[ -n $TARGET_USER ]]; then
