@@ -202,7 +202,9 @@ printf '%s\\n' "install-tooling.sh $*" >> "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/comm
 mkdir -p "$3/opt/devcar/tooling/plannotator/plannotator-review" "$3/usr/local/bin"
 echo plannotator/plannotator-review > "$3/opt/devcar/tooling/skills.list"
 touch "$3/opt/devcar/tooling/plannotator/plannotator-review/SKILL.md"
-printf '#!/bin/sh\\necho plannotator\\n' > "$3/usr/local/bin/plannotator"
+# Installs the downloaded binary, as the real installer does after verification.
+[[ -f $4/attestations.json ]]
+cp -- "$4/plannotator-linux-x64" "$3/usr/local/bin/plannotator"
 '''
 
 DEBIAN_SOURCES = """Types: deb
@@ -274,10 +276,13 @@ class InstallerRoot:
 
     def plannotator_release(self, tag, binary=True, attestation="valid"):
         """Publish TAG as Plannotator's latest; attestation: valid, none, malformed, or None."""
+        self.respond("https://api.github.com/repos/backnotprop/plannotator/releases/latest",
+                     json.dumps({"tag_name": tag, "assets": [{"name": "plannotator-linux-x64"}]}))
+        self.plannotator_artifacts(tag, binary, attestation)
+
+    def plannotator_artifacts(self, tag, binary=True, attestation="valid"):
         asset = "plannotator-linux-x64"
         content = f"plannotator {tag}".encode()
-        self.respond("https://api.github.com/repos/backnotprop/plannotator/releases/latest",
-                     json.dumps({"tag_name": tag, "assets": [{"name": asset}]}))
         self.respond(f"https://github.com/backnotprop/plannotator/releases/download/{tag}/{asset}",
                      content if binary else None)
         payload = base64.b64encode(json.dumps(
@@ -290,6 +295,9 @@ class InstallerRoot:
         }[attestation]
         self.respond("https://api.github.com/repos/backnotprop/plannotator/attestations/sha256:"
                      + hashlib.sha256(content).hexdigest(), body)
+
+    def downloads(self, url_part):
+        return [line for line in self.commands() if line.startswith("curl ") and url_part in line]
 
     def gog_release(self, tag, result="available"):
         self.respond("https://api.github.com/repos/openclaw/gogcli/releases/latest",
@@ -340,6 +348,7 @@ class InstallerRoot:
         self.respond(f"{tea_url}/checksums.txt",
                      f"{hashlib.sha256(tea_binary).hexdigest()}  {tea_asset}\n")
         self.respond(f"{tea_url}/checksums.txt.sig", installer_value("TEA_KEY"))
+        self.plannotator_artifacts(installer_value("PLANNOTATOR_KNOWN"))
         self.respond("https://api.github.com/repos/mattpocock/skills/commits/main",
                      json.dumps({"sha": "a" * 40}))
 
@@ -685,14 +694,31 @@ class HostInstallerReleaseTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("Latest plannotator v9.0.0 artifacts are unavailable", result.stderr)
                 self.assertEqual(system.tooling_tags(), [self.plannotator_known])
+                self.assertEqual(len(system.downloads(
+                    f"releases/download/{self.plannotator_known}/plannotator-linux-x64")), 1)
+                self.assertEqual((system.root / "usr/local/bin/plannotator").read_bytes(),
+                                 f"plannotator {self.plannotator_known}".encode())
 
-    def test_available_latest_plannotator_is_installed(self):
+    def test_unavailable_known_plannotator_release_fails_clearly(self):
+        self.system.plannotator_artifacts(self.plannotator_known, binary=False)
+
+        result = self.system.run()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"Could not obtain plannotator {self.plannotator_known}", result.stderr)
+        self.assertEqual(self.system.tooling_tags(), [])
+
+    def test_available_latest_plannotator_is_downloaded_once_and_installed(self):
         self.system.plannotator_release("v9.0.0")
 
         self.run_ok()
 
         self.assertEqual(self.system.tooling_tags(), ["v9.0.0"])
         self.assertEqual(self.recorded("plannotator"), "v9.0.0")
+        self.assertEqual(len(self.system.downloads("releases/download/v9.0.0/plannotator-linux-x64")), 1)
+        self.assertEqual(len(self.system.downloads("plannotator/attestations/")), 1)
+        self.assertEqual((self.system.root / "usr/local/bin/plannotator").read_bytes(),
+                         b"plannotator v9.0.0")
 
     def test_invalid_plannotator_attestation_response_stops_the_run(self):
         self.system.plannotator_release("v9.0.0", attestation="malformed")
@@ -757,6 +783,84 @@ class HostInstallerReleaseTests(unittest.TestCase):
         self.assertEqual(self.recorded("plannotator"), "v9.0.0")
         self.assertEqual(self.recorded("gog"), "v9.0.0")
         self.assertEqual(self.system.tooling_tags(), ["v9.0.0"])
+
+
+TOOLING_SUBSTITUTES = {
+    # Checkouts write a minimal tree for the sparse paths of each repository.
+    "git": '''
+if [[ $1 == -C ]]; then target=$2; shift 2; fi
+case $1 in
+    checkout)
+        if grep -qx /skills/ "$target/.git/info/sparse-checkout"; then
+            mkdir -p "$target/skills/demo" "$target/.claude-plugin"
+            touch "$target/skills/demo/SKILL.md" "$target/LICENSE"
+            echo '{"skills": ["./skills/demo"]}' > "$target/.claude-plugin/plugin.json"
+        else
+            mkdir -p "$target/apps/skills/core/plannotator-review"
+            touch "$target/apps/skills/core/plannotator-review/SKILL.md" \\
+                "$target/LICENSE-MIT" "$target/LICENSE-APACHE"
+        fi ;;
+    rev-parse) echo "${MATT_COMMIT}" ;;
+    init) mkdir -p "${@: -1}/.git/info" ;;
+esac
+''',
+    "curl": 'echo "unexpected download: $*" >&2\nexit 22\n',
+    "cosign": '''
+printf '%s\\n' "$*" >> "$TOOLING_LOG"
+[[ $(cat "${@: -1}") != *tampered* ]]
+''',
+    "uname": "echo x86_64\n",
+}
+
+
+class ToolingInstallerDownloadTests(unittest.TestCase):
+    """The tooling installer verifies a previous download instead of fetching it."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        for name in ("bash", "cat", "cp", "cut", "find", "grep", "install", "jq", "mkdir", "touch",
+                     "mktemp", "rm", "sed", "sha256sum", "sort", "uniq"):
+            (bin_dir / name).symlink_to(shutil.which(name, path="/usr/bin:/bin"))
+        for name, body in TOOLING_SUBSTITUTES.items():
+            (bin_dir / name).write_text("#!/usr/bin/env bash\n" + body)
+            (bin_dir / name).chmod(0o755)
+        self.download = self.root / "download"
+        self.download.mkdir()
+        (self.download / "attestations.json").write_text(json.dumps({"attestations": [{"bundle": {
+            "dsseEnvelope": {"payload": base64.b64encode(json.dumps(
+                {"predicateType": "https://slsa.dev/provenance/v1"}).encode()).decode()}}}]}))
+
+    def run_tooling(self, binary):
+        (self.download / "plannotator-linux-x64").write_text(binary)
+        return subprocess.run(
+            ["bash", str(ROOT / "install-tooling.sh"), "a" * 40, "v9.0.0",
+             str(self.root / "stage"), str(self.download)],
+            env={"PATH": str(self.root / "bin"), "TMPDIR": str(self.root),
+                 "TOOLING_LOG": str(self.root / "cosign.log"), "MATT_COMMIT": "a" * 40},
+            capture_output=True, text=True, timeout=60)
+
+    def test_previous_download_is_verified_and_installed_without_fetching(self):
+        result = self.run_tooling("#!/bin/sh\necho plannotator 9.0.0\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("unexpected download", result.stderr)
+        installed = self.root / "stage/usr/local/bin/plannotator"
+        self.assertEqual(installed.read_text(), "#!/bin/sh\necho plannotator 9.0.0\n")
+        cosign = (self.root / "cosign.log").read_text()
+        self.assertIn("--certificate-identity https://github.com/backnotprop/plannotator/"
+                      ".github/workflows/release.yml@refs/tags/v9.0.0", cosign)
+        self.assertIn("--type https://slsa.dev/provenance/v1", cosign)
+
+    def test_previous_download_that_fails_verification_is_not_installed(self):
+        result = self.run_tooling("#!/bin/sh\necho tampered\n")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.root / "cosign.log").exists(), result.stderr)
+        self.assertFalse((self.root / "stage/usr/local/bin/plannotator").exists())
 
 
 class HostInstallerRecoveryTests(unittest.TestCase):

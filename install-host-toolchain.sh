@@ -699,23 +699,25 @@ printf '%s  %s\n' "$tea_hash" "$tea_dir/$tea_asset" | sha256sum -c - >/dev/null 
 install_managed_binary "$tea_dir/$tea_asset" tea "$tea_tag"
 fi
 
-# The tooling installer downloads and verifies the known release itself; a newer
-# release must first show that its Linux binary and SLSA provenance exist.
+# Download the release binary and its attestations once; the tooling installer
+# verifies these same files with cosign before installing them.
 fetch_plannotator() {
-    local tag=$1 asset=plannotator-linux-x64 digest status=0
-    [[ $tag != "$PLANNOTATOR_KNOWN" ]] || return 0
-    jq -e --arg name "$asset" '[(.assets // [])[].name] | index($name) != null' \
-        "$WORK/plannotator-release.json" >/dev/null || return 1
+    local tag=$1 asset=plannotator-linux-x64 directory=$WORK/plannotator-$1 digest status=0
+    if [[ $tag != "$PLANNOTATOR_KNOWN" ]]; then
+        jq -e --arg name "$asset" '[(.assets // [])[].name] | index($name) != null' \
+            "$WORK/plannotator-release.json" >/dev/null || return 1
+    fi
+    mkdir -p "$directory"
     curl -fsSL --retry 3 \
         "https://github.com/backnotprop/plannotator/releases/download/$tag/$asset" \
-        -o "$WORK/plannotator-probe" || return 1
-    digest=$(sha256sum "$WORK/plannotator-probe" | awk '{print $1}')
+        -o "$directory/$asset" || return 1
+    digest=$(sha256sum "$directory/$asset" | awk '{print $1}')
     curl -fsSL --retry 3 \
         "https://api.github.com/repos/backnotprop/plannotator/attestations/sha256:$digest" \
-        -o "$WORK/plannotator-probe-attestations.json" || return 1
+        -o "$directory/attestations.json" || return 1
     jq -e '[.attestations[].bundle | select(.dsseEnvelope.payload | @base64d | fromjson
         | .predicateType == "https://slsa.dev/provenance/v1")] | length > 0' \
-        "$WORK/plannotator-probe-attestations.json" >/dev/null || status=$?
+        "$directory/attestations.json" >/dev/null || status=$?
     # jq -e exits 1 for a false result and higher for unreadable data.
     ((status != 1)) || return 1
     ((status == 0)) || die "Plannotator $tag attestation response is invalid."
@@ -730,7 +732,8 @@ matt_commit_json=$WORK/matt-commit.json
 curl -fsSL --retry 3 https://api.github.com/repos/mattpocock/skills/commits/main -o "$matt_commit_json"
 matt_commit=$(jq -er .sha "$matt_commit_json")
 [[ $matt_commit =~ ^[a-fA-F0-9]{40}$ ]] || die 'Invalid Matt Pocock commit ID.'
-bash "$SCRIPT_DIR/install-tooling.sh" "$matt_commit" "$plannotator_tag" "$tooling_stage"
+bash "$SCRIPT_DIR/install-tooling.sh" "$matt_commit" "$plannotator_tag" "$tooling_stage" \
+    "$WORK/plannotator-$plannotator_tag"
 tooling_generation=$(date -u +%Y%m%dT%H%M%SZ)-$$
 tooling_target=$TOOLING_GENERATIONS/$tooling_generation
 active_tooling=$(readlink -- "$TOOLING_DIR" 2>/dev/null || true)
