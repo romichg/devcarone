@@ -29,7 +29,10 @@ Code and Chromium), current Node.js LTS with its bundled npm, Codex, GitHub
 Copilot, opencode, pi, Claude Code, Firebase CLI, Playwright, tea, gogcli,
 Plannotator, and the shared Matt Pocock and Plannotator skills. The installer
 does not install Playwright browser downloads; Playwright should use Debian's
-Chromium (`channel: 'chrome'`). It does not provision Forgejo credentials.
+Chromium (`channel: 'chrome'`), so the installer links
+`/opt/google/chrome/chrome` to `/usr/bin/chromium` as the image does; an
+existing file or link there is kept with a warning. It does not provision
+Forgejo credentials.
 It adds `/etc/profile.d/devcarone-host-toolchain.sh` so login shells launch
 Plannotator with Debian Chromium. In another Docker image, also set
 `ENV PLANNOTATOR_BROWSER=/usr/bin/chromium PLANNOTATOR_REMOTE=0` for programs
@@ -51,7 +54,10 @@ one of those Debian suites or the signed Microsoft repository. Debian's
 package database does not retain the repository that originally supplied an
 installed package, so a matching version cannot prove its history. Existing
 Node, npm agent, tea, gogcli, or Plannotator commands without this installer's
-ownership record cause the run to stop.
+ownership record cause the run to stop. That check uses root's sanitized
+`PATH`, so it does not see a user's own installation earlier in their `PATH`
+(for example `~/.local/bin/claude`), which then shadows the managed command;
+run `command -v claude` as that user to check.
 
 Node's archive is checked against a GPG signed release manifest and the
 allowed Node signer fingerprints in the script. It is extracted with root
@@ -64,8 +70,11 @@ provenance for its release workflow. gogcli and its Go dependencies must pass
 Go's checksum database. The Matt Pocock skills use the commit fetched from
 GitHub's API and Git's object hashes, as in the Dockerfile. All installed
 release ownership records live under `/var/lib/devcarone-host-toolchain`;
-resolved npm versions are in the staged project's package lock. If a run is
-interrupted, run the installer again with `--update` to complete it.
+resolved npm versions are in the staged project's package lock. Each update
+keeps the new and the previously active Node release, npm generation, and
+skills generation, so already running agents keep working, and removes older
+ones; it leaves directories it did not name alone. If a run is interrupted,
+run the installer again with `--update` to complete it.
 
 For Go downloads, the script starts a temporary authenticated proxy on
 `127.0.0.1` that opens IPv4 upstream sockets. Both the Go module proxy and

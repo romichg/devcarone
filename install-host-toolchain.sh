@@ -401,6 +401,24 @@ if [[ -e "$PROFILE_FILE" ]] && \
 fi
 printf '%s\n' "$plannotator_profile" > "$PROFILE_FILE"
 
+# Playwright's "chrome" channel runs /opt/google/chrome/chrome; point it at
+# Debian's signed Chromium, as the image does, unless a browser is already there.
+chrome_link=$ROOT/opt/google/chrome/chrome
+if [[ -L $chrome_link && $(readlink -- "$chrome_link") == "$ROOT/usr/bin/chromium" ]]; then
+    :
+elif [[ -e $chrome_link || -L $chrome_link ]]; then
+    warn "Keeping the existing $chrome_link for Playwright's chrome channel."
+else
+    mkdir -p "${chrome_link%/*}"
+    for chrome_dir in "$ROOT/opt/google" "${chrome_link%/*}"; do
+        [[ -d $chrome_dir && ! -L $chrome_dir && $(stat -c %u "$chrome_dir") == "$OWNER_UID" ]] || \
+            die "Browser directory is not root-owned: $chrome_dir"
+        (( (8#$(stat -c %a "$chrome_dir") & 0022) == 0 )) || \
+            die "Browser directory is writable by non-root users: $chrome_dir"
+    done
+    ln -s -- "$ROOT/usr/bin/chromium" "$chrome_link"
+fi
+
 mkdir -p "$BIN_DIR" "$STATE_DIR" "$TOOL_DIR/node" "$TOOL_DIR/npm" "$TOOLING_GENERATIONS"
 for secure_dir in "$BIN_DIR" "$ROOT/usr/local/lib" "$STATE_DIR" "$TOOL_DIR" \
     "$TOOL_DIR/node" "$TOOL_DIR/npm" "$ROOT/opt/devcar" "$ROOT/opt/devcar/host-toolchain" \
@@ -457,6 +475,21 @@ install_managed_binary() {
     printf '%s\n' "$version" > "$STATE_DIR/$name.version"
     mv -f -- "$STATE_DIR/$name.sha256.new" "$STATE_DIR/$name.sha256"
 }
+# Remove superseded entries of an installer-owned DIRECTORY whose names match
+# PATTERN, keeping the named entries: the new one and the one active before
+# this run, which agents started earlier may still be using. Unrecognized
+# names are left alone, and a failure only warns.
+prune_generations() {
+    local directory=$1 pattern=$2 entry
+    shift 2
+    for entry in "$directory"/*; do
+        [[ -d $entry && ! -L $entry && ${entry##*/} =~ $pattern ]] || continue
+        case " $* " in *" ${entry##*/} "*) continue ;; esac
+        rm -rf -- "$entry" || warn "Could not remove superseded $entry"
+    done
+}
+readonly NODE_RELEASE_NAME='^[0-9]+[.][0-9]+[.][0-9]+([.]replaced[.][0-9]+)?$'
+readonly GENERATION_NAME='^[0-9]{8}T[0-9]{6}Z-[0-9]+$'
 
 for name in node npm npx corepack; do
     managed_link "$BIN_DIR/$name" "$TOOL_DIR/current-node/bin/$name"
@@ -557,6 +590,7 @@ done
 # that other accounts could modify or that an interrupted run left inactive.
 node_release=$TOOL_DIR/node/$node_version
 active_node=$(readlink -- "$TOOL_DIR/current-node" 2>/dev/null || true)
+active_npm=$(readlink -- "$TOOL_DIR/current-npm" 2>/dev/null || true)
 if [[ ! -e $node_release ]]; then
     mv -- "$node_stage" "$node_release"
 elif [[ $node_release != "$active_node" || -n $(untrusted_file "$node_release") ]]; then
@@ -588,7 +622,8 @@ done
 rm -f -- "$STATE_DIR/node-bins" "$STATE_DIR/npm-bins"
 printf '%s\n' "$node_version" > "$STATE_DIR/node-version"
 printf '%s\n' "$npm_generation" > "$STATE_DIR/npm-generation"
-PATH=$BIN_DIR:$SYSTEM_PATH npm cache clean --force
+prune_generations "$TOOL_DIR/node" "$NODE_RELEASE_NAME" "$node_version" "${active_node##*/}"
+prune_generations "$TOOL_DIR/npm" "$GENERATION_NAME" "$npm_generation" "${active_npm##*/}"
 
 # Metadata selects a release; cryptographic verification below decides whether
 # its bytes may be installed. Unavailable metadata or artifacts use the known
@@ -698,9 +733,11 @@ matt_commit=$(jq -er .sha "$matt_commit_json")
 bash "$SCRIPT_DIR/install-tooling.sh" "$matt_commit" "$plannotator_tag" "$tooling_stage"
 tooling_generation=$(date -u +%Y%m%dT%H%M%SZ)-$$
 tooling_target=$TOOLING_GENERATIONS/$tooling_generation
+active_tooling=$(readlink -- "$TOOLING_DIR" 2>/dev/null || true)
 mv -- "$tooling_stage/opt/devcar/tooling" "$tooling_target"
 set_link "$TOOLING_DIR" "$tooling_target"
 printf '%s\n' "$tooling_target" > "$STATE_DIR/tooling-target"
+prune_generations "$TOOLING_GENERATIONS" "$GENERATION_NAME" "$tooling_generation" "${active_tooling##*/}"
 install_managed_binary "$tooling_stage/usr/local/bin/plannotator" plannotator "$plannotator_tag"
 fi
 
@@ -746,15 +783,12 @@ if [[ -n $TARGET_USER ]]; then
     user_home=$(getent passwd "$TARGET_USER" | cut -d: -f6)
     user_shell=$(getent passwd "$TARGET_USER" | cut -d: -f7)
     [[ -d $user_home ]] || die "Home directory does not exist for $TARGET_USER"
-    gosu "$TARGET_USER" env HOME="$user_home" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
-        SHELL="$user_shell" CODEX_HOME="$user_home/.codex" \
-        python3 "$SCRIPT_DIR/configure-codex.py"
-    gosu "$TARGET_USER" env HOME="$user_home" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
-        SHELL="$user_shell" CLAUDE_CONFIG_DIR="$user_home/.claude" \
-        python3 "$SCRIPT_DIR/configure-claude.py"
+    as_user=(gosu "$TARGET_USER" env HOME="$user_home" USER="$TARGET_USER"
+        LOGNAME="$TARGET_USER" SHELL="$user_shell")
+    "${as_user[@]}" CODEX_HOME="$user_home/.codex" python3 "$SCRIPT_DIR/configure-codex.py"
+    "${as_user[@]}" CLAUDE_CONFIG_DIR="$user_home/.claude" python3 "$SCRIPT_DIR/configure-claude.py"
     DEVCAR_TOOLING=$TOOLING_DIR bash "$SCRIPT_DIR/link-skills.sh" "$ROOT/etc/codex/skills" on
-    gosu "$TARGET_USER" env HOME="$user_home" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
-        SHELL="$user_shell" DEVCAR_TOOLING="$TOOLING_DIR" \
+    "${as_user[@]}" DEVCAR_TOOLING="$TOOLING_DIR" \
         bash "$SCRIPT_DIR/link-skills.sh" "$user_home/.claude/skills" on
 else
     echo 'System tools installed. Run again with --user NAME to configure agent hooks and skills.'

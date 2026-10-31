@@ -800,8 +800,7 @@ class HostInstallerRecoveryTests(unittest.TestCase):
             self.assertEqual((state / f"{tool}.sha256").read_text().strip(),
                              hashlib.sha256(binary.read_bytes()).hexdigest())
             self.assertFalse((state / f"{tool}.sha256.new").exists())
-        self.assertEqual(sorted(path.name for path in (tools / "node").iterdir()),
-                         ["24.0.0", "24.1.0"])
+        self.assertIn("24.1.0", [path.name for path in (tools / "node").iterdir()])
         self.assertFalse(list((root / "usr/local/bin").glob("*.devcarone-new")))
 
     def test_update_completes_after_interruption_at_each_activation_step(self):
@@ -954,6 +953,128 @@ class HostInstallerBehaviorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("must be absolute and marked", result.stderr)
         self.assertEqual(self.system.commands(), [])
+
+    def test_repeated_updates_keep_current_and_previous_generations(self):
+        root = self.system.root
+        tools = root / "usr/local/lib/devcarone-toolchain"
+        generations = root / "opt/devcar/host-toolchain/tooling"
+        unrecognized = [tools / "node/custom", tools / "npm/keep-me", generations / "keep-me"]
+        self.assertSucceeded(self.system.run())
+        for directory in unrecognized:
+            directory.mkdir()
+        active = []
+        for version in ("24.1.0", "24.2.0", "24.3.0"):
+            self.system.node_version = version
+            self.system._respond_to_known_releases()
+            self.assertSucceeded(self.system.run("--update"))
+            active.append({link: os.readlink(link) for link in
+                           (tools / "current-node", tools / "current-npm", root / "opt/devcar/tooling")})
+
+        previous, current = active[-2], active[-1]
+        for link, target in current.items():
+            parent = Path(target).parent
+            kept = sorted(path for path in parent.iterdir() if path not in unrecognized)
+            self.assertEqual(kept, sorted({Path(target), Path(previous[link])}), parent)
+        for directory in unrecognized:
+            self.assertTrue(directory.is_dir(), directory)
+        state = root / "var/lib/devcarone-host-toolchain"
+        self.assertEqual((state / "tooling-target").read_text().strip(),
+                         current[root / "opt/devcar/tooling"])
+
+    def test_pruning_failure_warns_without_breaking_installation(self):
+        self.assertSucceeded(self.system.run())
+        old = self.node_release()
+        self.system.node_version = "24.1.0"
+        self.system._respond_to_known_releases()
+        self.assertSucceeded(self.system.run("--update"))
+        self.system.node_version = "24.2.0"
+        self.system._respond_to_known_releases()
+        # A directory the installer cannot remove (non-writable as non-root).
+        (old / "locked").mkdir()
+        (old / "locked/file").write_text("")
+        (old / "locked").chmod(0o555)
+        self.addCleanup((old / "locked").chmod, 0o755)
+
+        result = self.system.run("--update")
+
+        self.assertSucceeded(result)
+        if os.geteuid() != 0:
+            self.assertIn(f"Could not remove superseded {old}", result.stderr)
+        self.assertTrue((self.system.root / "usr/local/bin/node").exists())
+
+    def test_playwright_chrome_channel_links_debian_chromium(self):
+        root = self.system.root
+        link = root / "opt/google/chrome/chrome"
+
+        self.assertSucceeded(self.system.run())
+        self.assertEqual(os.readlink(link), f"{root}/usr/bin/chromium")
+
+        result = self.system.run("--update")
+        self.assertSucceeded(result)
+        self.assertEqual(os.readlink(link), f"{root}/usr/bin/chromium")
+        self.assertNotIn("Playwright", result.stderr)
+
+    def test_existing_chrome_installation_is_kept(self):
+        link = self.system.root / "opt/google/chrome/chrome"
+        for existing in ("file", "other link", "dangling link"):
+            with self.subTest(existing=existing):
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.unlink(missing_ok=True)
+                if existing == "file":
+                    link.write_text("#!/bin/sh\n")
+                else:
+                    link.symlink_to("/usr/bin/true" if existing == "other link" else "/missing")
+                before = os.readlink(link) if link.is_symlink() else link.read_text()
+
+                result = self.system.run("--update")
+
+                self.assertSucceeded(result)
+                self.assertIn(f"Keeping the existing {link}", result.stderr)
+                self.assertEqual(os.readlink(link) if link.is_symlink() else link.read_text(), before)
+
+    def test_writable_browser_directory_is_refused(self):
+        directory = self.system.root / "opt/google"
+        directory.mkdir(parents=True)
+        directory.chmod(0o777)
+
+        result = self.system.run()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"Browser directory is writable by non-root users: {directory}", result.stderr)
+        self.assertFalse(os.path.lexists(directory / "chrome/chrome"))
+
+    def test_user_configuration_shares_one_account_environment(self):
+        root = self.system.root
+        home = root / "home/agent user"
+        home.mkdir()
+        # The account and privilege drop are substitutes; gosu records its
+        # arguments and runs nothing, so no agent configuration is touched.
+        for name in ("getent", "id", "gosu"):
+            (root / "test-bin" / name).unlink()
+        self.system.write("test-bin/getent",
+                          f"#!/bin/sh\necho 'agent:x:1500:1500::{home}:/bin/zsh'\n", 0o755)
+        real_id = shutil.which("id", path="/usr/bin:/bin")
+        self.system.write("test-bin/id", f'''#!/usr/bin/env bash
+case $* in agent) exit 0 ;; "-u agent") echo 1500 ;; *) exec {real_id} "$@" ;; esac
+''', 0o755)
+        self.system.write("test-bin/gosu", '''#!/usr/bin/env bash
+python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@" >> "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/gosu.log"
+''', 0o755)
+
+        self.assertSucceeded(self.system.run("--user", "agent"))
+
+        calls = [json.loads(line) for line in (root / "gosu.log").read_text().splitlines()]
+        common = ["agent", "env", f"HOME={home}", "USER=agent", "LOGNAME=agent", "SHELL=/bin/zsh"]
+        bundle = self.system.bundle
+        self.assertEqual(calls, [
+            common + [f"CODEX_HOME={home}/.codex", "python3", f"{bundle}/configure-codex.py"],
+            common + [f"CLAUDE_CONFIG_DIR={home}/.claude", "python3", f"{bundle}/configure-claude.py"],
+            common + [f"DEVCAR_TOOLING={root}/opt/devcar/tooling", "bash",
+                      f"{bundle}/link-skills.sh", f"{home}/.claude/skills", "on"],
+        ])
+        self.assertTrue(any((root / "etc/codex/skills").iterdir()))
+        for name in ("LANG", "LC_ALL"):
+            self.assertFalse(any(argument.startswith(name + "=") for call in calls for argument in call))
 
     @unittest.skipIf(os.geteuid() == 0, "requires a non-root test account")
     def test_without_test_root_installer_requires_root(self):
