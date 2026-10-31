@@ -172,7 +172,7 @@ links. The installer is intended for a fresh image layer or empty staging root.
 Host installer tests set `DEVCAR_HOST_TOOLCHAIN_TEST_ROOT` to a temporary
 directory containing a `.devcarone-host-toolchain-test-root` marker; the
 installer then prefixes every system path with it, accepts its owner as root,
-and uses substitute apt, download, signature, build, and `gosu` commands from
+and uses substitute apt, download, signature, build, and `runuser` commands from
 its `test-bin`. Never run it as root against the real system for testing.
 
 Development usually happens inside a devcarone container without Docker. Docker

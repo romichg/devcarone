@@ -33,7 +33,12 @@ class HostToolchainParityTests(unittest.TestCase):
         body = DOCKERFILE.split("apt-get -y --no-install-recommends install \\\n", 1)[1]
         body = body.split("&&", 1)[0]
         image_packages = set(re.findall(r"[a-z0-9][a-z0-9+.-]+", body)) | {"code"}
-        self.assertEqual(words_in_assignment(INSTALLER, "APT_PACKAGES"), image_packages)
+        host_packages = words_in_assignment(INSTALLER, "APT_PACKAGES")
+        self.assertLessEqual(host_packages, image_packages)
+        # Container session, desktop, and driver packages stay out of hosts.
+        self.assertFalse(host_packages & {
+            "gosu", "sudo", "openssh-server", "tigervnc-standalone-server",
+            "openbox", "pulseaudio", "intel-media-va-driver-non-free"})
 
     def test_npm_package_set_matches_dockerfile(self):
         image_packages = set(re.findall(
@@ -179,11 +184,16 @@ esac
 printf '#!/bin/sh\\necho gog %s\\n' "$tag" > "$GOBIN/gog"
 chmod 755 "$GOBIN/gog"
 ''',
-    "gosu": 'shift\nexec "$@"\n',
+    "runuser": 'shift 3\nexec "$@"\n',
 }
 
 FAKE_NPM = '''#!/bin/sh
 printf '%s\\n' "npm $*" >> "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/commands.log"
+# Like npm 11, refuse one file loaded as both user and global configuration.
+if [ "${NPM_CONFIG_USERCONFIG-}" = "${NPM_CONFIG_GLOBALCONFIG-}" ]; then
+    echo "double-loading config \\"$NPM_CONFIG_GLOBALCONFIG\\" as \\"global\\"" >&2
+    exit 1
+fi
 prefix=
 while [ $# -gt 0 ]; do [ "$1" = --prefix ] && prefix=$2; shift; done
 if [ -n "$prefix" ] && [ ! -d "$prefix/node_modules/.bin" ]; then
@@ -450,12 +460,12 @@ class HostInstallerSourceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(all("vim" not in packages for packages in self.system.apt_installs()))
 
-    def test_missing_driver_reports_candidate_without_enabling_components(self):
-        self.system.write("apt/candidate/intel-media-va-driver-non-free", "(none)\n")
+    def test_missing_package_reports_candidate_without_enabling_components(self):
+        self.system.write("apt/candidate/pandoc", "(none)\n")
         before = self.snapshot()
         result = self.system.run()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("No apt candidate for intel-media-va-driver-non-free", result.stderr)
+        self.assertIn("No apt candidate for pandoc", result.stderr)
         self.assertEqual(self.snapshot(), before)
 
     def test_apt_failure_propagates_without_changing_sources(self):
@@ -550,7 +560,7 @@ class HostInstallerAptConsentTests(unittest.TestCase):
         self.assertEqual(result.stderr.count("Update curl from their signed apt repositories?"), 1)
         self.assertEqual(self.system.installed("curl"), "0.9")
         self.assertEqual(self.system.apt_installs()[0], ["ca-certificates", "gnupg", "jq", "xz-utils"])
-        self.assertIn("sudo", self.system.apt_installs()[1])
+        self.assertIn("pandoc", self.system.apt_installs()[1])
         self.assertNotIn("curl", self.system.apt_installs()[1])
 
     def test_accepting_upgrades_existing_packages(self):
@@ -1153,7 +1163,7 @@ class HostInstallerBehaviorTests(unittest.TestCase):
         self.assertFalse((root / "etc/apt/sources.list.d/vscode.list").exists())
         self.assertFalse((root / "etc/profile.d/devcarone-host-toolchain.sh").exists())
         install = [line for line in self.system.commands()
-                   if line.startswith("apt-get -y --no-install-recommends install sudo")]
+                   if line.startswith("apt-get -y --no-install-recommends install wget")]
         self.assertEqual(len(install), 1)
         self.assertIn(" code", install[0])
         self.assertIn("System tools installed.", result.stdout)
@@ -1304,9 +1314,9 @@ class HostInstallerBehaviorTests(unittest.TestCase):
         root = self.system.root
         home = root / "home/agent user"
         home.mkdir()
-        # The account and privilege drop are substitutes; gosu records its
+        # The account and privilege drop are substitutes; runuser records its
         # arguments and runs nothing, so no agent configuration is touched.
-        for name in ("getent", "id", "gosu"):
+        for name in ("getent", "id", "runuser"):
             (root / "test-bin" / name).unlink()
         self.system.write("test-bin/getent",
                           f"#!/bin/sh\necho 'agent:x:1500:1500::{home}:/bin/zsh'\n", 0o755)
@@ -1314,14 +1324,14 @@ class HostInstallerBehaviorTests(unittest.TestCase):
         self.system.write("test-bin/id", f'''#!/usr/bin/env bash
 case $* in agent) exit 0 ;; "-u agent") echo 1500 ;; *) exec {real_id} "$@" ;; esac
 ''', 0o755)
-        self.system.write("test-bin/gosu", '''#!/usr/bin/env bash
-python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@" >> "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/gosu.log"
+        self.system.write("test-bin/runuser", '''#!/usr/bin/env bash
+python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@" >> "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/runuser.log"
 ''', 0o755)
 
         self.assertSucceeded(self.system.run("--user", "agent"))
 
-        calls = [json.loads(line) for line in (root / "gosu.log").read_text().splitlines()]
-        common = ["agent", "env", f"HOME={home}", "USER=agent", "LOGNAME=agent", "SHELL=/bin/zsh"]
+        calls = [json.loads(line) for line in (root / "runuser.log").read_text().splitlines()]
+        common = ["-u", "agent", "--", "env", f"HOME={home}", "USER=agent", "LOGNAME=agent", "SHELL=/bin/zsh"]
         bundle = self.system.bundle
         self.assertEqual(calls, [
             common + [f"CODEX_HOME={home}/.codex", "python3", f"{bundle}/configure-codex.py"],

@@ -247,19 +247,16 @@ if [[ -z ${PRESERVED_COMMANDS[code]:-} && -z $(installed_version code) && ( -z $
     apt-get update
 fi
 
+# The Dockerfile's developer tools, without its container session, desktop,
+# SSH/VNC, logging, and graphics-driver packages.
 APT_PACKAGES=(
-    sudo procps locales lsof file dialog gosu tzdata
-    curl wget ca-certificates apt-transport-https gnupg
-    net-tools netcat-traditional rsyslog logrotate
-    openssh-server rsync xauth tigervnc-standalone-server openbox tint2 feh x11-xserver-utils
-    rxvt-unicode pulseaudio mesa-utils vainfo libva2 intel-media-va-driver-non-free libpci3
-    fontconfig fonts-dejavu fonts-noto-core fonts-liberation
-    vim strace ripgrep jq unzip 7zip xz-utils poppler-utils fonts-noto ffmpeg imagemagick
+    curl wget ca-certificates gnupg rsync
+    file vim strace lsof ripgrep jq unzip 7zip xz-utils poppler-utils ffmpeg imagemagick
+    fonts-noto fonts-liberation
     pandoc texlive-xetex texlive-latex-base texlive-latex-recommended texlive-latex-extra lmodern
     chromium build-essential git golang-go
     python3 python3-pip python3-venv python3-pytest python3-yaml python3-tomlkit cosign code
 )
-
 
 select_apt_packages "${APT_PACKAGES[@]}"
 apt_install "${APT_REQUEST[@]}"
@@ -464,7 +461,9 @@ NPM_PACKAGES=(
 )
 npm_stage=$WORK/npm-stage
 mkdir "$npm_stage"
-export NPM_CONFIG_USERCONFIG=/dev/null NPM_CONFIG_GLOBALCONFIG=/dev/null
+# npm refuses to load one file as both user and global configuration, so give
+# each its own absent path rather than sharing /dev/null.
+export NPM_CONFIG_USERCONFIG=$WORK/npm-userconfig NPM_CONFIG_GLOBALCONFIG=$WORK/npm-globalconfig
 export NPM_CONFIG_CACHE=$WORK/npm-cache
 PATH=$node_stage/bin:$SYSTEM_PATH "$node_stage/bin/npm" install --prefix "$npm_stage" \
     --registry="$NPM_REGISTRY" --ignore-scripts "${NPM_PACKAGES[@]}"
@@ -718,7 +717,7 @@ if [[ -n $TARGET_USER ]]; then
     user_home=$(getent passwd "$TARGET_USER" | cut -d: -f6)
     user_shell=$(getent passwd "$TARGET_USER" | cut -d: -f7)
     [[ -d $user_home ]] || die "Home directory does not exist for $TARGET_USER"
-    as_user=(gosu "$TARGET_USER" env HOME="$user_home" USER="$TARGET_USER"
+    as_user=(runuser -u "$TARGET_USER" -- env HOME="$user_home" USER="$TARGET_USER"
         LOGNAME="$TARGET_USER" SHELL="$user_shell")
     "${as_user[@]}" CODEX_HOME="$user_home/.codex" python3 "$SCRIPT_DIR/configure-codex.py"
     "${as_user[@]}" CLAUDE_CONFIG_DIR="$user_home/.claude" python3 "$SCRIPT_DIR/configure-claude.py"
