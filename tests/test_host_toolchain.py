@@ -184,6 +184,11 @@ chmod 755 "$GOBIN/gog"
 
 FAKE_NPM = '''#!/bin/sh
 printf '%s\\n' "npm $*" >> "$DEVCAR_HOST_TOOLCHAIN_TEST_ROOT/commands.log"
+# Like npm 11, refuse one file loaded as both user and global configuration.
+if [ "${NPM_CONFIG_USERCONFIG-}" = "${NPM_CONFIG_GLOBALCONFIG-}" ]; then
+    echo "double-loading config \\"$NPM_CONFIG_GLOBALCONFIG\\" as \\"global\\"" >&2
+    exit 1
+fi
 prefix=
 while [ $# -gt 0 ]; do [ "$1" = --prefix ] && prefix=$2; shift; done
 if [ -n "$prefix" ] && [ ! -d "$prefix/node_modules/.bin" ]; then

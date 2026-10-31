@@ -464,7 +464,9 @@ NPM_PACKAGES=(
 )
 npm_stage=$WORK/npm-stage
 mkdir "$npm_stage"
-export NPM_CONFIG_USERCONFIG=/dev/null NPM_CONFIG_GLOBALCONFIG=/dev/null
+# npm refuses to load one file as both user and global configuration, so give
+# each its own absent path rather than sharing /dev/null.
+export NPM_CONFIG_USERCONFIG=$WORK/npm-userconfig NPM_CONFIG_GLOBALCONFIG=$WORK/npm-globalconfig
 export NPM_CONFIG_CACHE=$WORK/npm-cache
 PATH=$node_stage/bin:$SYSTEM_PATH "$node_stage/bin/npm" install --prefix "$npm_stage" \
     --registry="$NPM_REGISTRY" --ignore-scripts "${NPM_PACKAGES[@]}"
