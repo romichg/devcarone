@@ -225,6 +225,10 @@ Host requirements: Bash, Docker, sudo/mount with OverlayFS support, `setsid`
 existing `/dev/dri/renderD128` GPU device. X mode also requires `xauth` and a
 working host X display. Audio is forwarded when `/run/user/$(id -u)/pulse` exists.
 
+To install the same developer tools directly on a Debian Trixie amd64 machine
+or in another Debian image, without the container, use
+`install-host-toolchain.sh`; see [HOST-TOOLCHAIN.md](HOST-TOOLCHAIN.md).
+
 ## Download verification
 
 The build checks each download against a trust root recorded in this
@@ -251,6 +255,15 @@ does not install them. `/opt/google/chrome/chrome` links to Debian's signed
 `channel: 'chrome'` in test configurations (Playwright MCP uses it by default).
 The `Dockerfile` keeps a commented-out step for Firefox and WebKit; uncomment it
 and rebuild to test with them, accepting unverified downloads.
+
+`install-host-toolchain.sh` uses the same trust roots, with these
+differences. It first checks that every apt source is the standard Debian
+archive or security repository signed by the Debian archive keyring, and that
+no apt setting weakens authentication. It installs the latest tea, Plannotator,
+and gogcli releases when they verify, otherwise the `Dockerfile` versions. gogcli's Go
+downloads go through a temporary local proxy (`go-ipv4-proxy.py`) that only
+forces IPv4; Go still verifies TLS and the checksum database. Its own state
+records live in `/var/lib/devcarone-host-toolchain`.
 
 When updating a pinned version, refresh its trust data: the base image digest,
 the archive key list when Debian adds keys, `keys/nodejs-release.asc` and its

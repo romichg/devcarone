@@ -70,6 +70,17 @@ Keep it consistent with implementation changes.
   a system git credential helper scoped to `FORGEJO_URL` and a tea login in
   `/run/devcar/tea`. `/usr/local/bin/tea` wraps the pinned binary in
   `/opt/devcar/bin/tea` to select that login.
+- `install-host-toolchain.sh` installs the image's toolchain on a Debian
+  Trixie amd64 host or another image, without the container runtime; usage
+  and behavior are in `HOST-TOOLCHAIN.md`. It validates the apt sources before
+  apt runs, asks before changing installed packages unless `--update` is
+  given, and records what it owns in `/var/lib/devcarone-host-toolchain`.
+  Node, npm generations, and skills generations live in
+  `/usr/local/lib/devcarone-toolchain` and `/opt/devcar/host-toolchain`,
+  activated by links. It reuses `install-tooling.sh`, passing a fourth
+  argument with Plannotator's already downloaded binary and attestations,
+  which are verified as usual. `go-ipv4-proxy.py` is a temporary loopback
+  proxy that makes Go's downloads use IPv4.
 - gogcli is built at image build time with `go install` (checked by Go's
   checksum database) into `/usr/local/bin/gog`; Homebrew is not installed. The
   launcher mounts `$GOGCLI_STATE_HOME` at `GOG_HOME` to persist auth across
@@ -130,7 +141,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install tomlkit
 PATH="$PWD/.venv/bin:$PATH" python3 -m unittest discover -s tests -v
 bash -n devcarone entrypoint.sh install-tooling.sh link-skills.sh \
-    forgejo/configure-forgejo.sh
+    forgejo/configure-forgejo.sh install-host-toolchain.sh
 sh -n desktop/xstartup desktop/devcar-terminal forgejo/tea forgejo/forgejo-credential \
     client/devcarone-ssh
 git diff --check
@@ -151,6 +162,12 @@ downloads, provenance verification (with `cosign` on PATH), and the skill list
 can be tested without root or Docker;
 run `link-skills.sh` with `DEVCAR_TOOLING` pointing into that root to check the
 links. The installer is intended for a fresh image layer or empty staging root.
+
+Host installer tests set `DEVCAR_HOST_TOOLCHAIN_TEST_ROOT` to a temporary
+directory containing a `.devcarone-host-toolchain-test-root` marker; the
+installer then prefixes every system path with it, accepts its owner as root,
+and uses substitute apt, download, signature, build, and `gosu` commands from
+its `test-bin`. Never run it as root against the real system for testing.
 
 Development usually happens inside a devcarone container without Docker. Docker
 build and interactive X/VNC/SSH/Plannotator checks are separate from unit
